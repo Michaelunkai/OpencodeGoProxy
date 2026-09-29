@@ -524,13 +524,7 @@ namespace OpencodeGoProxy
                 {
                     try
                     {
-                        var tray = new ProxyTrayIcon(() =>
-                        {
-                            var snap = ReadCredentials(config.credential_source);
-                            double minScore = 100;
-                            foreach (string k in snap.Keys) { double s = KeyScore(k); if (s < minScore) minScore = s; }
-                            return "keys=" + snap.Keys.Count + " min_score=" + minScore.ToString("0");
-                        });
+                        var tray = new ProxyTrayIcon(config.credential_source, configPath);
                         System.Windows.Forms.Application.Run();
                     }
                     catch { }
@@ -1926,16 +1920,10 @@ namespace OpencodeGoProxy
                 else if (IsKeyCoolingDown(keys[i])) quotaCooling.Add(i);
                 else healthy.Add(i);
             }
-            // Order: usable keys first (most remaining quota first), then keys
-            // cooling from a quota/rate limit, then keys that this specific model
-            // is policy-blocked on (always last). File order breaks ties.
             var result = new List<int>();
             result.AddRange(healthy.OrderByDescending(i => KeyScore(keys[i])));
             result.AddRange(quotaCooling.OrderByDescending(i => KeyScore(keys[i])));
             result.AddRange(modelBlocked.OrderByDescending(i => KeyScore(keys[i])));
-            Console.WriteLine("KEY_ORDER model=" + (model ?? "") +
-                " healthy=" + healthy.Count + " cooling=" + quotaCooling.Count + " blocked=" + modelBlocked.Count +
-                " order=" + String.Join(",", result.Select(i => "s" + (i + 1) + "=" + KeyScore(keys[i]).ToString("0"))));
             return result;
         }
 
@@ -1986,7 +1974,7 @@ namespace OpencodeGoProxy
                 TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(20));
         }
 
-        private static double KeyScore(string key)
+        internal static double KeyScore(string key)
         {
             if (String.IsNullOrEmpty(key)) return 100.0;
             double score;
@@ -2320,90 +2308,302 @@ namespace OpencodeGoProxy
     }
 
     // ======================================================================
-    // System tray icon — shows proxy status and key health at a glance.
+    // System tray icon — single icon with full proxy management.
+    // Merged from SystemTray.cs: health checks, key reorder, file watchers.
     // ======================================================================
     internal sealed class ProxyTrayIcon : IDisposable
     {
         private System.Windows.Forms.NotifyIcon trayIcon;
         private System.Windows.Forms.Timer refreshTimer;
-        private Func<string> getStatus;
+        private System.Windows.Forms.Timer healthTimer;
+        private string credentialPath;
+        private string configPath;
+        private FileSystemWatcher keyWatcher;
 
-        public ProxyTrayIcon(Func<string> statusProvider)
+        public ProxyTrayIcon(string credentialFilePath, string configFilePath)
         {
-            getStatus = statusProvider;
+            credentialPath = credentialFilePath;
+            configPath = configFilePath;
+
             trayIcon = new System.Windows.Forms.NotifyIcon();
-            trayIcon.Icon = CreateProxyIcon();
+            trayIcon.Icon = CreateCircleIcon(Color.FromArgb(0, 200, 80));
             trayIcon.Text = "OpenCode Go Proxy";
             trayIcon.Visible = true;
-
-            var menu = new System.Windows.Forms.ContextMenuStrip();
-            menu.Items.Add("Show Status", null, (s, e) => System.Windows.Forms.MessageBox.Show(getStatus(), "OpenCode Go Proxy", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Information));
-            menu.Items.Add("-");
-            menu.Items.Add("Exit", null, (s, e) => { trayIcon.Visible = false; System.Windows.Forms.Application.Exit(); });
-            trayIcon.ContextMenuStrip = menu;
+            trayIcon.ContextMenuStrip = BuildMenu();
+            trayIcon.DoubleClick += (s, e) => ShowStatus();
 
             trayIcon.BalloonTipTitle = "OpenCode Go Proxy";
-            trayIcon.BalloonTipText = "Proxy started. Right-click for options.";
+            trayIcon.BalloonTipText = "Proxy running. Right-click for options.";
 
             refreshTimer = new System.Windows.Forms.Timer();
             refreshTimer.Interval = 30000;
             refreshTimer.Tick += (s, e) => UpdateStatus();
             refreshTimer.Start();
 
+            healthTimer = new System.Windows.Forms.Timer();
+            healthTimer.Interval = 120000;
+            healthTimer.Tick += (s, e) => CheckHealth();
+            healthTimer.Start();
+
+            SetupKeyWatcher();
             UpdateStatus();
+        }
+
+        private System.Windows.Forms.ContextMenuStrip BuildMenu()
+        {
+            var m = new System.Windows.Forms.ContextMenuStrip();
+            m.Items.Add("Show Status", null, (s, e) => ShowStatus());
+            m.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            m.Items.Add("Reorder Keys by Quota", null, (s, e) => ReorderKeys());
+            m.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            m.Items.Add("Open Config", null, (s, e) => SafeStart("notepad.exe", configPath));
+            m.Items.Add("Open Keys", null, (s, e) => SafeStart("notepad.exe", credentialPath));
+            m.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            m.Items.Add("Exit", null, (s, e) => ExitApp());
+            return m;
         }
 
         private void UpdateStatus()
         {
             try
             {
-                string status = getStatus();
-                trayIcon.Text = "OpenCode Go Proxy - " + status.Substring(0, Math.Min(60, status.Length));
-                // Green = healthy, Yellow = degraded, Red = error
-                bool hasExhausted = status.Contains("score=0");
-                bool allExhausted = status.Contains("all_keys_exhausted");
-                if (allExhausted)
+                int keyCount = 0;
+                double minScore = 100;
+                if (!String.IsNullOrEmpty(credentialPath) && File.Exists(credentialPath))
                 {
-                    trayIcon.Icon = CreateColorIcon(Color.FromArgb(220, 50, 47));
-                    trayIcon.BalloonTipIcon = System.Windows.Forms.ToolTipIcon.Error;
+                    string[] lines = File.ReadAllLines(credentialPath);
+                    var keys = new List<string>();
+                    foreach (string line in lines)
+                    {
+                        string k = line.Trim();
+                        if (k.Length > 0) keys.Add(k);
+                    }
+                    keyCount = keys.Count;
+                    foreach (string k in keys)
+                    {
+                        double s = Program.KeyScore(k);
+                        if (s < minScore) minScore = s;
+                    }
                 }
-                else if (hasExhausted)
-                {
-                    trayIcon.Icon = CreateColorIcon(Color.FromArgb(255, 193, 7));
-                    trayIcon.BalloonTipIcon = System.Windows.Forms.ToolTipIcon.Warning;
-                }
+                string statusText = keyCount + " key(s), best=" + minScore.ToString("0");
+                trayIcon.Text = "OpenCode Go Proxy — " + statusText;
+                if (minScore <= 0 && keyCount > 0)
+                    trayIcon.Icon = CreateCircleIcon(Color.FromArgb(255, 193, 7));
                 else
+                    trayIcon.Icon = CreateCircleIcon(Color.FromArgb(0, 200, 80));
+            }
+            catch
+            {
+                trayIcon.Icon = CreateCircleIcon(Color.FromArgb(220, 50, 47));
+            }
+        }
+
+        private void CheckHealth()
+        {
+            try
+            {
+                var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("http://127.0.0.1:4001/health");
+                req.Timeout = 5000;
+                using (var resp = req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
                 {
-                    trayIcon.Icon = CreateColorIcon(Color.FromArgb(38, 166, 91));
-                    trayIcon.BalloonTipIcon = System.Windows.Forms.ToolTipIcon.Info;
+                    string json = sr.ReadToEnd();
+                    int ki = json.IndexOf("\"credential_count\"");
+                    int kv = ki >= 0 ? json.IndexOf(":", ki) + 1 : -1;
+                    string ks = kv >= 0 ? json.Substring(kv, 20).Trim().TrimEnd('}', ',') : "?";
+                    trayIcon.Text = "OpenCode Go Proxy — " + ks + " key(s)";
+                }
+            }
+            catch
+            {
+                trayIcon.Text = "OpenCode Go Proxy — offline";
+                trayIcon.Icon = CreateCircleIcon(Color.FromArgb(220, 50, 47));
+            }
+        }
+
+        private void ShowStatus()
+        {
+            try
+            {
+                var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("http://127.0.0.1:4001/health");
+                req.Timeout = 5000;
+                using (var resp = req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                {
+                    string json = sr.ReadToEnd();
+                    string keys = ExtractJson(json, "credential_count");
+                    string model = ExtractJson(json, "model");
+                    string lines = "Proxy: running\nKeys: " + keys + "\nModel: " + model;
+                    try
+                    {
+                        if (!String.IsNullOrEmpty(credentialPath) && File.Exists(credentialPath))
+                        {
+                            int count = File.ReadAllLines(credentialPath).Length;
+                            lines += "\nKey file lines: " + count;
+                        }
+                    }
+                    catch { }
+                    System.Windows.Forms.MessageBox.Show(lines, "OpenCode Go Proxy",
+                        System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Information);
+                }
+            }
+            catch
+            {
+                System.Windows.Forms.MessageBox.Show("Proxy is not responding.", "OpenCode Go Proxy",
+                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
+            }
+        }
+
+        private void ReorderKeys()
+        {
+            try
+            {
+                if (String.IsNullOrEmpty(credentialPath) || !File.Exists(credentialPath))
+                {
+                    trayIcon.ShowBalloonTip(3000, "Keys", "api.txt not found.", System.Windows.Forms.ToolTipIcon.Warning);
+                    return;
+                }
+                string[] lines = File.ReadAllLines(credentialPath);
+                var scored = new List<KeyValuePair<string, double>>();
+                foreach (string line in lines)
+                {
+                    string k = line.Trim();
+                    if (k.Length == 0) continue;
+                    double max = ProbeUsage(k);
+                    scored.Add(new KeyValuePair<string, double>(k, 100.0 - max));
+                }
+                if (scored.Count < 2)
+                {
+                    trayIcon.ShowBalloonTip(3000, "Keys", "Need 2+ keys to reorder.", System.Windows.Forms.ToolTipIcon.Warning);
+                    return;
+                }
+                scored.Sort((a, b) => b.Value.CompareTo(a.Value));
+                string backup = credentialPath + ".bak-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                File.Copy(credentialPath, backup, true);
+                var sorted = new List<string>();
+                foreach (var s in scored) sorted.Add(s.Key);
+                File.WriteAllLines(credentialPath, sorted.ToArray());
+                trayIcon.ShowBalloonTip(3000, "Keys Reordered", "Best key first. Backup saved.", System.Windows.Forms.ToolTipIcon.Info);
+            }
+            catch (Exception ex)
+            {
+                trayIcon.ShowBalloonTip(3000, "Keys Error", ex.Message, System.Windows.Forms.ToolTipIcon.Error);
+            }
+        }
+
+        private static double ProbeUsage(string key)
+        {
+            try
+            {
+                var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("https://opencode.ai/zen/go/v1/usage");
+                req.Method = "GET";
+                req.Headers["Authorization"] = "Bearer " + key;
+                req.Accept = "application/json";
+                req.Timeout = 20000;
+                using (var resp = req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                {
+                    string json = sr.ReadToEnd();
+                    double max = 0;
+                    foreach (string w in new[] { "rolling", "weekly", "monthly" })
+                    {
+                        double p = ParseWindowPercent(json, w);
+                        if (p > max) max = p;
+                    }
+                    return max;
+                }
+            }
+            catch { return 50.0; }
+        }
+
+        private static double ParseWindowPercent(string json, string window)
+        {
+            string search = "\"" + window + "\"";
+            int wi = json.IndexOf(search);
+            if (wi < 0) return 0;
+            int pi = json.IndexOf("\"percent\"", wi);
+            if (pi < 0) return 0;
+            int c = json.IndexOf(":", pi + 8);
+            if (c < 0) return 0;
+            int s = c + 1;
+            while (s < json.Length && json[s] == ' ') s++;
+            int e = s;
+            while (e < json.Length && json[e] != ',' && json[e] != '}' && json[e] != '\n' && json[e] != '"') e++;
+            double p;
+            if (double.TryParse(json.Substring(s, e - s).Trim(), System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out p)) return p;
+            return 0;
+        }
+
+        private void SetupKeyWatcher()
+        {
+            try
+            {
+                if (String.IsNullOrEmpty(credentialPath)) return;
+                string keyDir = Path.GetDirectoryName(credentialPath);
+                string keyName = Path.GetFileName(credentialPath);
+                if (!String.IsNullOrEmpty(keyDir) && Directory.Exists(keyDir))
+                {
+                    keyWatcher = new FileSystemWatcher(keyDir, keyName) { EnableRaisingEvents = true };
+                    keyWatcher.Changed += (s, e) => { UpdateStatus(); };
                 }
             }
             catch { }
         }
 
-        private static Icon CreateColorIcon(Color color)
+        private void ExitApp()
         {
-            Bitmap bmp = new Bitmap(16, 16);
+            healthTimer.Stop();
+            refreshTimer.Stop();
+            trayIcon.Visible = false;
+            Log("TRAY_EXIT");
+            Environment.Exit(0);
+        }
+
+        private static void SafeStart(string file, string arg)
+        {
+            try { System.Diagnostics.Process.Start(file, arg); } catch { }
+        }
+
+        private static void Log(string msg)
+        {
+            try
+            {
+                string logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Logs");
+                Directory.CreateDirectory(logDir);
+                string logFile = Path.Combine(logDir, "tray-" + DateTime.Now.ToString("yyyyMMdd") + ".log");
+                File.AppendAllText(logFile, DateTime.Now.ToString("o") + " " + msg + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        private static string ExtractJson(string json, string key)
+        {
+            string search = "\"" + key + "\"";
+            int i = json.IndexOf(search);
+            if (i < 0) return "?";
+            int c = json.IndexOf(":", i + search.Length);
+            if (c < 0) return "?";
+            int s = c + 1;
+            while (s < json.Length && (json[s] == ' ' || json[s] == '"')) s++;
+            int e = s;
+            while (e < json.Length && json[e] != ',' && json[e] != '}' && json[e] != '\n' && json[e] != '"') e++;
+            return json.Substring(s, e - s).Trim();
+        }
+
+        private static Icon CreateCircleIcon(Color color)
+        {
+            Bitmap bmp = new Bitmap(16, 16, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
             using (Graphics g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 g.Clear(Color.Transparent);
-                // Rounded square background
-                using (Brush bg = new SolidBrush(color))
-                    g.FillRectangle(bg, 1, 1, 14, 14);
-                // "G" letter for Go proxy
-                using (Font f = new Font("Segoe UI", 9f, FontStyle.Bold))
-                using (Brush fg = new SolidBrush(Color.White))
-                    g.DrawString("G", f, fg, -1, 0);
+                using (Brush b = new SolidBrush(color))
+                    g.FillEllipse(b, 1, 1, 14, 14);
             }
             IntPtr hIcon = bmp.GetHicon();
             Icon icon = Icon.FromHandle(hIcon);
             return icon;
-        }
-
-        private static Icon CreateProxyIcon()
-        {
-            return CreateColorIcon(Color.FromArgb(38, 166, 91));
         }
 
         public void ShowNotification(string title, string text, System.Windows.Forms.ToolTipIcon icon = System.Windows.Forms.ToolTipIcon.Info)
@@ -2414,6 +2614,8 @@ namespace OpencodeGoProxy
         public void Dispose()
         {
             if (refreshTimer != null) { refreshTimer.Stop(); refreshTimer.Dispose(); }
+            if (healthTimer != null) { healthTimer.Stop(); healthTimer.Dispose(); }
+            if (keyWatcher != null) keyWatcher.Dispose();
             if (trayIcon != null) { trayIcon.Visible = false; trayIcon.Dispose(); }
         }
     }
