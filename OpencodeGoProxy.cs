@@ -316,8 +316,13 @@ namespace OpencodeGoProxy
         private const string DefaultConfigPath = "config.json";
         private const string DefaultListenPrefix = "http://127.0.0.1:4001/";
         private const string DefaultUpstreamBaseUrl = "https://opencode.ai/zen/go/v1";
-        private const string PublicModel = "opencode-go";
-        private const string UpstreamModel = "kimi-k3";
+    private const string PublicModel = "opencode-go";
+    private const string UpstreamModel = "kimi-k3";
+    // Every request must reach upstream carrying an OpenCode identity. Callers
+    // that send their own UA (docker containers, SDKs) would otherwise be
+    // demoted to the free tier by the upstream gate. The UA is always enforced;
+    // only an already-OpenCode caller UA is kept as-is.
+    private const string UpstreamUserAgent = "opencode/1.1.4";
         private const int MaximumRequestBytes = 32 * 1024 * 1024;
         private static readonly JavaScriptSerializer Json = CreateJsonSerializer();
         private static readonly HttpClient UpstreamClient = CreateHttpClient();
@@ -748,8 +753,17 @@ namespace OpencodeGoProxy
             if (snapshot.Keys.Count != config.credential_count)
             {
                 config.credential_count = snapshot.Keys.Count;
-                WriteConfigAtomically(configPath, config);
-                Console.WriteLine("CREDENTIALS_REFRESHED configured_keys=" + snapshot.Keys.Count);
+                // A locked/readonly config file must never fail a valid request;
+                // the in-memory count stays authoritative until the next rewrite.
+                try
+                {
+                    WriteConfigAtomically(configPath, config);
+                    Console.WriteLine("CREDENTIALS_REFRESHED configured_keys=" + snapshot.Keys.Count);
+                }
+                catch (Exception rewriteFailure)
+                {
+                    Console.WriteLine("CREDENTIALS_REWRITE_SKIPPED type=" + rewriteFailure.GetType().Name);
+                }
             }
             return snapshot;
         }
@@ -824,6 +838,7 @@ namespace OpencodeGoProxy
                     {
                         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", keys[index]);
                         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                        request.Headers.TryAddWithoutValidation("user-agent", UpstreamUserAgent);
                         using (HttpResponseMessage response = await UpstreamClient.SendAsync(request,
                             HttpCompletionOption.ResponseContentRead).ConfigureAwait(false))
                         {
@@ -886,7 +901,11 @@ namespace OpencodeGoProxy
             try { decoded = Json.DeserializeObject(inputText); }
             catch (Exception ex)
             {
-                Console.WriteLine("REWRITE_MODEL json_parse_failed type=" + ex.GetType().Name + " using_regex_fallback");
+                string head = inputText;
+                if (head.Length > 120) head = head.Substring(0, 120);
+                Console.WriteLine("REWRITE_MODEL json_parse_failed type=" + ex.GetType().Name +
+                    " message=" + (ex.Message ?? "null") + " len=" + input.Length +
+                    " head=" + head.Replace("\r", "\\r").Replace("\n", "\\n"));
                 return RegexFallbackRewriteModel(input, inputText, publicModel, upstreamModel, config, keys);
             }
             var body = decoded as IDictionary<string, object>;
@@ -1738,8 +1757,11 @@ namespace OpencodeGoProxy
                             if (clientWire == UpstreamWire.Messages)
                                 request.Headers.TryAddWithoutValidation("x-api-key", keys[index]);
                             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", keys[index]);
-                            request.Headers.TryAddWithoutValidation("x-opencode-session", sessionId);
-                            foreach (string headerName in new[] { "anthropic-version", "anthropic-beta", "openai-beta", "user-agent",
+                            if (String.IsNullOrWhiteSpace(sessionId))
+                                request.Headers.TryAddWithoutValidation("x-opencode-session", Guid.NewGuid().ToString("D"));
+                            else
+                                request.Headers.TryAddWithoutValidation("x-opencode-session", sessionId);
+                            foreach (string headerName in new[] { "anthropic-version", "anthropic-beta", "openai-beta",
                                 "x-opencode-project", "x-opencode-request", "x-opencode-client" })
                             {
                                 string headerValue = context.Request.Headers[headerName];
@@ -1747,10 +1769,16 @@ namespace OpencodeGoProxy
                                     request.Headers.TryAddWithoutValidation(headerName, headerValue);
                             }
                             // The free-tier gate only allows checks that look like
-                            // they come from the OpenCode client; fall back to a
-                            // matching client identity when the caller sent none.
-                            if (String.IsNullOrWhiteSpace(context.Request.Headers["user-agent"]))
-                                request.Headers.TryAddWithoutValidation("user-agent", "opencode/1.0.0");
+                            // they come from the OpenCode client. Enforce that
+                            // identity on every request regardless of what the
+                            // caller sent; a third-party UA (docker, SDK) must
+                            // never reach upstream or the request is demoted.
+                            string callerUserAgent = context.Request.Headers["user-agent"];
+                            if (!String.IsNullOrWhiteSpace(callerUserAgent) &&
+                                callerUserAgent.IndexOf("opencode", StringComparison.OrdinalIgnoreCase) >= 0)
+                                request.Headers.TryAddWithoutValidation("user-agent", callerUserAgent);
+                            else
+                                request.Headers.TryAddWithoutValidation("user-agent", UpstreamUserAgent);
                             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
                             using (HttpResponseMessage response = await UpstreamClient.SendAsync(request,
                                 HttpCompletionOption.ResponseContentRead).ConfigureAwait(false))
@@ -1762,7 +1790,12 @@ namespace OpencodeGoProxy
                                     " wire=" + WireName(targetWire) + " translated=" + translated);
                                 bool workspacePolicyFailover = status == 400 && IsWorkspacePolicyRetryable(responseText);
                                 bool insufficientFunds = IsInsufficientFunds(status, responseText);
-                                bool zenTrigger = insufficientFunds || workspacePolicyFailover;
+                                // Only a real balance failure may divert to the
+                                // free-tier Zen path. A workspace-policy 400 must
+                                // rotate across the remaining paid keys; remapping
+                                // to a "-free" model mid-rotation would surface
+                                // FreeTierError 403 and break the request.
+                                bool zenTrigger = insufficientFunds;
                                 // A 2xx envelope can still carry an in-band error frame
                                 // ("event: error" / error JSON). Relaying it to the
                                 // client looks like a broken stream; treat it as an
@@ -1774,14 +1807,23 @@ namespace OpencodeGoProxy
                                     " policy_failover=" + workspacePolicyFailover + " insufficient_funds=" + insufficientFunds +
                                     " free_tier=" + freeTier + " error_frame=" + errorFrame +
                                     " remaining_keys=" + (keyOrder.Count - orderIndex - 1));
+                                if (insufficientFunds && orderIndex + 1 < keyOrder.Count)
+                                {
+                                    // Another key may still hold balance; keep
+                                    // rotating the paid path before any free-tier
+                                    // divert. Zen fires only when the LAST key
+                                    // confirms the funds state.
+                                    MarkKeyCooldown(keys[index], status, false);
+                                    Console.WriteLine("FUNDS_FAILOVER status=" + status + " failed_slot=" + slot +
+                                        " next_slot=" + (keyOrder[orderIndex + 1] + 1));
+                                    continue;
+                                }
                                 if (zenTrigger && !String.IsNullOrEmpty(config.zen_upstream_base_url))
                                 {
-                                    // Workspace-level policy errors (Global regions, training
-                                    // consent) affect ALL keys from the same account, so there
-                                    // is no point trying the remaining keys — they will all
-                                    // fail the same way. Trigger Zen fallback immediately.
-                                    // Insufficient funds also triggers immediately because the
-                                    // upstream balance is shared across all keys.
+                                    // Insufficient funds triggers immediately because
+                                    // the upstream balance is shared across all keys.
+                                    // Policy errors keep rotating instead (the paid
+                                    // keys stay on the paid endpoint).
                                     lastGoStatus = status;
                                     lastGoResponse = responseText;
                                     zenFallbackTriggered = true;
@@ -1847,7 +1889,20 @@ namespace OpencodeGoProxy
                                 }
                                 else
                                 {
-                                    WriteBytes(context.Response, status, Encoding.UTF8.GetBytes(RedactSecrets(responseText, config, keys)));
+                                    // Never relay the free-tier gate text to the
+                                    // client on final rotation either: it reads like
+                                    // a hard failure. Synthesize a retryable one.
+                                    if (IsFreeTierFailure(status, responseText))
+                                    {
+                                        Console.WriteLine("FINAL_RELAY free_tier_suppressed status=" + status);
+                                        WriteBytes(context.Response, 503, Encoding.UTF8.GetBytes(
+                                            "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"model temporarily unavailable (workspace policy/funds); retry shortly\",\"retryable\":true}}"));
+                                        context.Response.Headers["Retry-After"] = "15";
+                                    }
+                                    else
+                                    {
+                                        WriteBytes(context.Response, status, Encoding.UTF8.GetBytes(RedactSecrets(responseText, config, keys)));
+                                    }
                                 }
                                 return;
                             }
@@ -1883,7 +1938,7 @@ namespace OpencodeGoProxy
                     {
                         Console.WriteLine("ZEN_FALLBACK_NO_KEYS");
                         WriteBytes(context.Response, lastGoStatus, Encoding.UTF8.GetBytes(
-                            lastGoResponse ?? "{\"error\":{\"message\":\"Go upstream failed and no Zen keys configured.\"}}"));
+                            RedactSecrets(lastGoResponse ?? "{\"error\":{\"message\":\"Go upstream failed and no Zen keys configured.\"}}", config, zenSnapshot.Keys)));
                         return;
                     }
                     string zenPayloadText = Encoding.UTF8.GetString(payload);
@@ -1921,14 +1976,24 @@ namespace OpencodeGoProxy
                                 zenRequest.Content = new ByteArrayContent(zenOutbound);
                                 zenRequest.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
                                 zenRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", zenSnapshot.Keys[z]);
-                                zenRequest.Headers.TryAddWithoutValidation("x-opencode-session", sessionId);
-                                foreach (string headerName in new[] { "anthropic-version", "anthropic-beta", "openai-beta", "user-agent",
+                                if (String.IsNullOrWhiteSpace(sessionId))
+                                    zenRequest.Headers.TryAddWithoutValidation("x-opencode-session", Guid.NewGuid().ToString("D"));
+                                else
+                                    zenRequest.Headers.TryAddWithoutValidation("x-opencode-session", sessionId);
+                                foreach (string headerName in new[] { "anthropic-version", "anthropic-beta", "openai-beta",
                                     "x-opencode-project", "x-opencode-request", "x-opencode-client" })
                                 {
                                     string headerValue = context.Request.Headers[headerName];
                                     if (!String.IsNullOrWhiteSpace(headerValue))
                                         zenRequest.Headers.TryAddWithoutValidation(headerName, headerValue);
                                 }
+                                // Same enforced identity policy as the primary path.
+                                string zenCallerUserAgent = context.Request.Headers["user-agent"];
+                                if (!String.IsNullOrWhiteSpace(zenCallerUserAgent) &&
+                                    zenCallerUserAgent.IndexOf("opencode", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    zenRequest.Headers.TryAddWithoutValidation("user-agent", zenCallerUserAgent);
+                                else
+                                    zenRequest.Headers.TryAddWithoutValidation("user-agent", UpstreamUserAgent);
                                 zenRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
                                 using (HttpResponseMessage zenResponse = await UpstreamClient.SendAsync(zenRequest,
                                     HttpCompletionOption.ResponseContentRead).ConfigureAwait(false))
@@ -1956,9 +2021,21 @@ namespace OpencodeGoProxy
                                         }
                                         return;
                                     }
-                                    if (zenStatus >= 400 && z + 1 < zenSnapshot.Keys.Count) continue;
-                                    WriteBytes(context.Response, zenStatus, Encoding.UTF8.GetBytes(RedactSecrets(zenText, config, zenSnapshot.Keys)));
-                                    return;
+                    if (zenStatus >= 400 && z + 1 < zenSnapshot.Keys.Count) continue;
+                    // A FreeTierError from the free variant is upstream telling us
+                    // the identity cannot serve free models; relaying it crashes
+                    // client-side retry logic. Synthesize a retryable envelope
+                    // instead and let the caller's next attempt use the paid path.
+                    if (IsFreeTierFailure(zenStatus, zenText))
+                    {
+                        Console.WriteLine("ZEN_FALLBACK_FREE_TIER_GATED suppressed_free_relay");
+                        WriteBytes(context.Response, 503, Encoding.UTF8.GetBytes(
+                            "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"paid model temporarily unavailable (insufficient funds); retry shortly\",\"retryable\":true}}"));
+                        context.Response.Headers["Retry-After"] = "15";
+                        return;
+                    }
+                    WriteBytes(context.Response, zenStatus, Encoding.UTF8.GetBytes(RedactSecrets(zenText, config, zenSnapshot.Keys)));
+                    return;
                                 }
                             }
                         }
@@ -1968,16 +2045,28 @@ namespace OpencodeGoProxy
                             if (z + 1 < zenSnapshot.Keys.Count) continue;
                         }
                     }
-                    // Zen also failed; return the original Go error.
+                    // Zen also failed; never relay a FreeTierError to the client.
+                    // Synthesize the retryable envelope so the client's attempt
+                    // continues cleanly on the next request (paid keys cooldown in
+                    // the meantime and win again on future scoring).
+                    if (IsFreeTierFailure(lastGoStatus, lastGoResponse) ||
+                        IsFreeTierFailure(0, lastGoResponse))
+                    {
+                        Console.WriteLine("ZEN_FALLBACK_EXHAUSTED free_tier_suppressed status=" + lastGoStatus);
+                        WriteBytes(context.Response, 503, Encoding.UTF8.GetBytes(
+                            "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"paid model temporarily unavailable (insufficient funds / policy); retry shortly\",\"retryable\":true}}"));
+                        context.Response.Headers["Retry-After"] = "15";
+                        return;
+                    }
                     Console.WriteLine("ZEN_FALLBACK_EXHAUSTED returning_go_error status=" + lastGoStatus);
                     WriteBytes(context.Response, lastGoStatus, Encoding.UTF8.GetBytes(
-                        lastGoResponse ?? "{\"error\":{\"message\":\"All upstreams failed.\"}}"));
+                        RedactSecrets(lastGoResponse ?? "{\"error\":{\"message\":\"All upstreams failed.\"}}", config, keys)));
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("ZEN_FALLBACK_ERROR type=" + ex.GetType().Name);
                     WriteBytes(context.Response, lastGoStatus, Encoding.UTF8.GetBytes(
-                        lastGoResponse ?? "{\"error\":{\"message\":\"Zen fallback failed.\"}}"));
+                        RedactSecrets(lastGoResponse ?? "{\"error\":{\"message\":\"Zen fallback failed.\"}}", config, keys)));
                 }
             }
         }
@@ -2152,6 +2241,7 @@ namespace OpencodeGoProxy
                         {
                             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
                             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                            request.Headers.TryAddWithoutValidation("user-agent", UpstreamUserAgent);
                             using (HttpResponseMessage response = UpstreamClient.SendAsync(request,
                                 HttpCompletionOption.ResponseContentRead).GetAwaiter().GetResult())
                             {
@@ -2348,6 +2438,7 @@ namespace OpencodeGoProxy
                         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
                         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", credentials.Keys[index]);
                         request.Headers.TryAddWithoutValidation("x-opencode-session", Guid.NewGuid().ToString("D"));
+                        request.Headers.TryAddWithoutValidation("user-agent", UpstreamUserAgent);
                         using (HttpResponseMessage response = UpstreamClient.SendAsync(request,
                             HttpCompletionOption.ResponseContentRead).GetAwaiter().GetResult())
                         {

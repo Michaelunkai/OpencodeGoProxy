@@ -1,0 +1,2 @@
+﻿{"listen_prefix": "http://127.0.0.1:4005/","upstream_base_url":"https://opencode.ai/zen/go/v1","zen_upstream_base_url":"https://opencode.ai/zen/v1","credential_source":"api.txt","zen_credential_source":"api.txt","local_api_key":"7rPWb0YtL2miBuu2dep2Qv0kc7LNj-QpRhDIOOxLgqk","public_model":"opencode-go","upstream_model":"kimi-k3","credential_count":3,"zen_credential_count":0,"retry_server_error_from":500,"retry_http_statuses":[401,402,403,408,425,429],"streaming_mode":"buffer-before-response-to-preserve-failover"}
+
