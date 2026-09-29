@@ -1,0 +1,1 @@
+offcd /d "F:\study\repos\aiml\AI_and_Machine_Learning\Artificial_Intelligence\cli\opencode\OpencodeGoProxy":loopecho [Tue 09/29/2026  4:29:05.48] starting proxy  -Mode Serve -ConfigPath "F:\study\repos\aiml\AI_and_Machine_Learning\Artificial_Intelligence\cli\opencode\OpencodeGoProxy\config.json"  [Tue 09/29/2026  4:29:05.48] proxy exited, restarting in 2s  -n 3 127.0.0.1 

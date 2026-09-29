@@ -1,0 +1,9 @@
+/OpencodeGoProxy.exe
+/SystemTray.exe
+/config.json
+/proxy.stdout.log
+/proxy.stderr.log
+/test-artifacts/
+/model-protocols.json
+/Logs/
+

@@ -1,0 +1,29 @@
+# OpenCode Go local failover proxy
+
+This project exposes a small OpenAI-compatible API at `http://127.0.0.1:4000/v1/chat/completions`. Send `model: "opencode-go"`; the proxy maps it to the configured OpenCode Go model (`kimi-k3`). It reads upstream keys in file order from `F:\backup\windowsapps\credentials\opencodego\api.txt`.
+
+The credential file is read at request time. Keep the current key on line 1 and append the purchased fallback key on line 2. The next request refreshes the list without restarting the proxy or regenerating `config.json`. Keys stay in memory and are not written to the generated config or log files. A second key must belong to an independently usable OpenCode Go subscription to provide quota isolation; a second key alone does not establish that.
+
+The proxy retries authentication/quota/rate-limit statuses `401`, `402`, `403`, `408`, `425`, and `429`, all `500+` responses, and transport errors. It reuses the same transformed request bytes and waits for each upstream response before replying to the client. Streaming requests are buffered so a retry can still happen before any response bytes reach the client.
+
+The listener binds to loopback only. The local client bearer key is `opencode-local-proxy-key`. Do not expose this listener directly to an untrusted network.
+
+## Build and run
+
+Use the Windows PowerShell executable at `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`:
+
+```powershell
+& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -ExecutionPolicy Bypass -File '.\build.ps1'
+& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -ExecutionPolicy Bypass -File '.\generate_config.ps1'
+& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -ExecutionPolicy Bypass -File '.\start_proxy.ps1'
+```
+
+Run `test_proxy.ps1` to exercise a local 429-to-200 rotation with two synthetic keys and then make a minimal live completion request through the proxy. Use `-SimulationOnly` to avoid a provider request, or `-LiveOnly` to test only the already running proxy.
+
+## Client example
+
+```text
+Base URL: http://127.0.0.1:4000/v1
+Model: opencode-go
+API key: opencode-local-proxy-key
+```
