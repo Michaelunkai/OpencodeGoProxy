@@ -8,9 +8,9 @@ Smart API key rotation proxy for OpenCode Go/Zen models with weighted scoring, i
 
 1. Copy this folder anywhere
 2. Add your API keys to `api.txt` (one per line)
-3. Run `start.cmd` — or double-click `OpencodeGoProxy.exe`
+3. Double-click `OpencodeGoProxy.exe`
 
-That's it. Zero configuration needed.
+That's it. Zero configuration needed. The proxy auto-starts at Windows logon via a scheduled task.
 
 ## Features
 
@@ -47,9 +47,7 @@ When Go upstream fails, retry on Zen instantly:
 |------|---------|
 | `OpencodeGoProxy.exe` | The proxy (self-contained, no install needed) |
 | `config.json` | Configuration (defaults work out of the box) |
-| `api.txt` | Your API keys (create this file) |
-| `start.cmd` | Silent launcher (zero pop-ups) |
-| `stop.cmd` | Stop the proxy |
+| `api.txt` | Your API keys (create this file, one per line) |
 | `build.ps1` | Rebuild from source |
 
 ## Configuration

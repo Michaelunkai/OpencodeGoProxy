@@ -335,7 +335,8 @@ namespace OpencodeGoProxy
             try
             {
                 string mode = GetArgument(args, "-Mode") ?? "Serve";
-                string configPath = Path.GetFullPath(GetArgument(args, "-ConfigPath") ?? DefaultConfigPath);
+                string exeDir = Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location) ?? AppDomain.CurrentDomain.BaseDirectory;
+                string configPath = Path.GetFullPath(Path.Combine(exeDir, GetArgument(args, "-ConfigPath") ?? DefaultConfigPath));
                 if (mode.Equals("GenerateConfig", StringComparison.OrdinalIgnoreCase))
                 {
                     string credentialPath = Path.GetFullPath(GetArgument(args, "-CredentialPath") ?? DefaultCredentialPath);
