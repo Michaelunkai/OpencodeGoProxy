@@ -325,6 +325,19 @@ namespace OpencodeGoProxy
     private const string UpstreamUserAgent = "opencode/1.1.4";
         private const int MaximumRequestBytes = 32 * 1024 * 1024;
         private static readonly JavaScriptSerializer Json = CreateJsonSerializer();
+
+        // Serve mode is tray-first: detach the parent console window (when the
+        // exe is run directly or double-clicked) so operation needs no terminal.
+        // Launched via cmd redirect (the supervisor) this is a no-op because the
+        // child console IS the redirection pipe - hiding it would break logs.
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern bool AllocConsole();
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern IntPtr GetConsoleWindow();
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         private static readonly HttpClient UpstreamClient = CreateHttpClient();
 
         private static int Main(string[] args)
@@ -353,6 +366,12 @@ namespace OpencodeGoProxy
 
                 if (mode.Equals("Serve", StringComparison.OrdinalIgnoreCase))
                 {
+                    // Tray-first operation: when the exe is double-clicked or
+                    // launched directly, detach the console so only the tray
+                    // icon remains. The supervisor passes -ShowConsole to keep
+                    // its log redirection working.
+                    if (!(Array.IndexOf(args ?? new string[0], "-ShowConsole") >= 0))
+                        TryDetachConsoleForServe();
                     Serve(configPath).GetAwaiter().GetResult();
                     return 0;
                 }
@@ -404,6 +423,21 @@ namespace OpencodeGoProxy
                 if (String.Equals(args[i], name, StringComparison.OrdinalIgnoreCase)) return args[i + 1];
             }
             return null;
+        }
+
+        private static void TryDetachConsoleForServe()
+        {
+            try
+            {
+                IntPtr console = GetConsoleWindow();
+                if (console == IntPtr.Zero) return;
+                // Only hide when this console window belongs to THIS process and
+                // is not already hidden; the supervisor redirect keeps its own
+                // hidden console, so the check on visibility avoids hiding logs.
+                ShowWindow(console, 0);
+                Console.WriteLine("CONSOLE_DETACHED tray_only=true");
+            }
+            catch { }
         }
 
         private static string CreateLocalApiKey()
@@ -502,19 +536,13 @@ namespace OpencodeGoProxy
                 return port;
             }
             catch { }
-            for (int p = preferred; p < 65535; p++)
-            {
-                try
-                {
-                    var tcpl = new TcpListener(IPAddress.Loopback, p);
-                    tcpl.Start();
-                    int port = ((IPEndPoint)tcpl.LocalEndpoint).Port;
-                    tcpl.Stop();
-                    return port;
-                }
-                catch { }
-            }
-            throw new InvalidOperationException("No available TCP port found.");
+            // Another proxy instance already owns the preferred port. Silently
+            // exiting is the only correct behavior: every listener reads its
+            // URL from config.json, so a shifted orphan just strands traffic
+            // and produces the duplicate tray icons users discover by accident.
+            Console.WriteLine("DUPLICATE_EXIT requested-port-busy=" + preferred);
+            Environment.Exit(0);
+            return preferred;
         }
 
         // Self-healing setup: on a fresh Windows, running the proxy once makes it
