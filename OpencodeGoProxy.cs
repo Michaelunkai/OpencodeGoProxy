@@ -1675,15 +1675,21 @@ namespace OpencodeGoProxy
                                 Console.WriteLine("UPSTREAM_RETRY_DECISION status=" + status + " retry_status=" + retryStatus +
                                     " policy_failover=" + workspacePolicyFailover + " insufficient_funds=" + insufficientFunds +
                                     " remaining_keys=" + (keyOrder.Count - orderIndex - 1));
-                                if (zenTrigger && !String.IsNullOrEmpty(config.zen_upstream_base_url) && orderIndex + 1 >= keyOrder.Count)
+                                if (zenTrigger && !String.IsNullOrEmpty(config.zen_upstream_base_url))
                                 {
-                                    // All Go keys exhausted with a funds/privacy error.
-                                    // Remember the failure for Zen fallback after wire attempts finish.
+                                    // Workspace-level policy errors (Global regions, training
+                                    // consent) affect ALL keys from the same account, so there
+                                    // is no point trying the remaining keys — they will all
+                                    // fail the same way. Trigger Zen fallback immediately.
+                                    // Insufficient funds also triggers immediately because the
+                                    // upstream balance is shared across all keys.
                                     lastGoStatus = status;
                                     lastGoResponse = responseText;
                                     zenFallbackTriggered = true;
                                     Console.WriteLine("ZEN_FALLBACK_QUEUED model=" + (model ?? "") +
-                                        " reason=" + (insufficientFunds ? "funds" : "privacy") + " status=" + status);
+                                        " reason=" + (insufficientFunds ? "funds" : "privacy") +
+                                        " status=" + status + " triggered_on_slot=" + slot +
+                                        " remaining_keys_skipped=" + (keyOrder.Count - orderIndex - 1));
                                     break;
                                 }
                                 if (retryStatus)
@@ -1927,6 +1933,9 @@ namespace OpencodeGoProxy
             result.AddRange(healthy.OrderByDescending(i => KeyScore(keys[i])));
             result.AddRange(quotaCooling.OrderByDescending(i => KeyScore(keys[i])));
             result.AddRange(modelBlocked.OrderByDescending(i => KeyScore(keys[i])));
+            Console.WriteLine("KEY_ORDER model=" + (model ?? "") +
+                " healthy=" + healthy.Count + " cooling=" + quotaCooling.Count + " blocked=" + modelBlocked.Count +
+                " order=" + String.Join(",", result.Select(i => "s" + (i + 1) + "=" + KeyScore(keys[i]).ToString("0"))));
             return result;
         }
 
@@ -2038,9 +2047,9 @@ namespace OpencodeGoProxy
         private static double ParseMaxUsagePercent(string json)
         {
             // Parse per-window usage and compute a weighted score that
-            // maximizes all limit windows simultaneously. The most-constrained
-            // window dominates the score so the proxy naturally rotates to the
-            // key with the most headroom across every window.
+            // prioritizes the longest-lived limits (monthly, then weekly)
+            // because they are hardest to recover. Rolling (5-hour) resets
+            // fast so it matters least for long-term key maximization.
             double rolling = 0, weekly = 0, monthly = 0;
             try
             {
@@ -2053,13 +2062,18 @@ namespace OpencodeGoProxy
                 monthly = ParseWindow(usage, "monthly");
             }
             catch { }
-            // Weighted: rolling limit is the tightest (5-hour), so it dominates.
-            // weekly and monthly act as secondary constraints.
-            double weighted = rolling * 0.6 + weekly * 0.25 + monthly * 0.15;
+            // If any window is fully exhausted the key is rate-limited for that
+            // window. Return 100 immediately so RefreshKeyUsage scores it as 0.
+            double maxWindow = Math.Max(rolling, Math.Max(weekly, monthly));
+            if (maxWindow >= 100) return 100;
+            // Weighted: monthly (50%) > weekly (35%) > rolling (15%).
+            // This ensures the proxy always picks the key with the most
+            // remaining monthly and weekly headroom, even if rolling is higher.
+            double weighted = monthly * 0.50 + weekly * 0.35 + rolling * 0.15;
             Console.WriteLine("KEY_USAGE_WINDOWS rolling=" + rolling.ToString("0.#") +
                 " weekly=" + weekly.ToString("0.#") + " monthly=" + monthly.ToString("0.#") +
                 " weighted=" + weighted.ToString("0.#"));
-            return Math.Max(rolling, Math.Max(weekly, monthly));
+            return weighted;
         }
 
         private static double ParseWindow(IDictionary<string, object> usage, string windowName)
