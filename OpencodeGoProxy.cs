@@ -2075,8 +2075,12 @@ namespace OpencodeGoProxy
         {
             if (String.IsNullOrEmpty(responseText)) return false;
             if (responseText.IndexOf("event: error", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            return responseText.IndexOf("\"error\"", StringComparison.Ordinal) >= 0 &&
-                responseText.IndexOf("\"type\"", StringComparison.Ordinal) >= 0;
+            // A real in-band error is an error OBJECT ("error":{...}). Healthy
+            // OpenCode Responses SSE carries "error":null inside the completed
+            // envelope — matching the bare key word there killed good streams
+            // and poisoned the pool, which surfaced as random model outages.
+            if (responseText.IndexOf("\"error\":{", StringComparison.Ordinal) >= 0) return true;
+            return false;
         }
 
         /// <summary>True when the upstream free-tier gate rejected the request.</summary>
