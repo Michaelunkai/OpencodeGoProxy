@@ -2,7 +2,16 @@
 
 ![Hero Banner](images/hero-banner.png)
 
+![tests](https://img.shields.io/badge/tests-5%2F5%20passing-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows-blue) ![runtime](https://img.shields.io/badge/runtime-%2EFX%204.0%20portable-informational) ![license](https://img.shields.io/badge/license-MIT-green)
+
 Smart API key rotation proxy for OpenCode Go/Zen models with weighted scoring, immediate Zen fallback, and a single system tray icon for full management.
+
+**Highlights (current hard build):**
+- Wire ladder always starts on the client's own wire — no untranslated cross-wire attempts, no more `invalid_union` / empty `event:error` frames
+- In-band `event: error` SSE frames and `FreeTierError` 403s are treated as upstream failures: the proxy keeps rotating keys and, worst case, answers with a valid retryable error instead of a broken stream
+- Failover order = lowest **monthly → weekly → daily → rolling 5-hour** spend first, across any number of keys (a 4th key added to `api.txt` joins rotation immediately)
+- System-tray rotator mark (three key slots around a routing chevron) with cached GDI icons
+- `tests/verify.ps1` — 5-check live verification harness
 
 ## Quick Start (Fresh Windows)
 
@@ -18,9 +27,14 @@ That's it. Zero configuration needed. The proxy auto-starts at Windows logon via
 
 ### Smart Key Rotation
 Weighted scoring prioritizes long-lived limits:
-- **Monthly (50%)** — hardest to recover
-- **Weekly (35%)** — second priority
-- **Rolling 5h (15%)** — resets fastest
+- **Monthly (0.45)** — hardest to recover
+- **Weekly (0.30)** — second priority
+- **Daily / 7-day (0.15)** — mid-term window
+- **Rolling 5h (0.10)** — resets fastest
+
+Weights are normalized across the windows the upstream reports, and any
+window that hits 100% immediately benches the key.
+
 
 ![Zen Fallback](images/feature-fallback.png)
 
@@ -40,6 +54,21 @@ When Go upstream fails, retry on Zen instantly:
 ## Architecture
 
 ![Architecture](images/architecture.png)
+
+![Features](images/features.png)
+
+![Tray Mark](images/tray-icon-preview.png)
+
+## Testing
+
+Live harness against the running proxy (health, unique model catalog, cheapest-keys
+first round trip, responses wire, secret-redaction scan):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\verify.ps1
+```
+
+Latest run: `RESULT passes=5 failures=0`
 
 ## Files
 
