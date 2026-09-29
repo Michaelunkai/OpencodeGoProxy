@@ -946,6 +946,27 @@ namespace OpencodeGoProxy
                 object inputValue;
                 if (!body.TryGetValue("input", out inputValue) || !IsNonEmptyInput(inputValue))
                     return input;
+                // Encrypted reasoning blobs are issued per caller (workspace+key).
+                // A continuation that echoes them back may be served by a
+                // different key after rotation; upstream then fails the whole
+                // request with "reasoning encrypted_content was not issued to
+                // this caller". Drop those items before they cross the wire so
+                // every rotated request stays valid; textual reasoning stays.
+                object sanitized = StripUnreplayableReasoning(inputValue);
+                if (!ReferenceEquals(sanitized, inputValue))
+                {
+                    body["input"] = sanitized;
+                    Console.WriteLine("REASONING_SANITIZED encrypted_items_removed=true");
+                }
+                object previousResponseId;
+                if (body.TryGetValue("previous_response_id", out previousResponseId))
+                {
+                    // Same issuer-binding problem: a continuation id minted by
+                    // another key is invalid here. The full history travels in
+                    // "input", so dropping the pointer is lossless for us.
+                    body.Remove("previous_response_id");
+                    Console.WriteLine("PREVIOUS_RESPONSE_ID_DROPPED key_bound=true");
+                }
             }
             else
             {
@@ -979,8 +1000,41 @@ namespace OpencodeGoProxy
             return Encoding.UTF8.GetBytes(Json.Serialize(body));
         }
 
-        private static byte[] RegexFallbackRewriteModel(byte[] input, string inputText, string publicModel, string upstreamModel, ProxyConfig config, IList<string> keys)
+        // Removes reasoning items whose content only the issuing caller can
+        // replay (encrypted_content). JavaScriptSerializer deserializes arrays
+        // as fixed-size object[], so rebuild the list instead of mutating it.
+        private static object StripUnreplayableReasoning(object input)
         {
+            var items = input as IList;
+            if (items == null || items.Count == 0) return input;
+            var keep = new List<object>();
+            int removed = 0;
+            foreach (object item in items)
+            {
+                var dict = item as IDictionary<string, object>;
+                if (dict != null)
+                {
+                    object itemType;
+                    string type = dict.TryGetValue("type", out itemType) ? Convert.ToString(itemType) : null;
+                    if (type != null && type.IndexOf("reasoning", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        object encrypted;
+                        if (dict.TryGetValue("encrypted_content", out encrypted) && encrypted != null)
+                        {
+                            removed++;
+                            continue;
+                        }
+                    }
+                }
+                keep.Add(item);
+            }
+            if (removed == 0) return input;
+            object[] rebuilt = new object[keep.Count];
+            for (int i = 0; i < keep.Count; i++) rebuilt[i] = keep[i];
+            return rebuilt;
+        }
+
+        private static byte[] RegexFallbackRewriteModel(byte[] input, string inputText, string publicModel, string upstreamModel, ProxyConfig config, IList<string> keys)        {
             // Regex-based model rewrite when JSON parser fails.
             // Only rewrite if the model is "opencode-go" -> upstreamModel.
             if (!inputText.Contains(publicModel)) return input;
