@@ -309,7 +309,10 @@ namespace OpencodeGoProxy
 
     internal static class Program
     {
-        private const string DefaultCredentialPath = @"F:\backup\windowsapps\credentials\opencodego\api.txt";
+        private static string DefaultCredentialPath
+        {
+            get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "api.txt"); }
+        }
         private const string DefaultConfigPath = "config.json";
         private const string DefaultListenPrefix = "http://127.0.0.1:4000/";
         private const string DefaultUpstreamBaseUrl = "https://opencode.ai/zen/go/v1";
@@ -447,8 +450,9 @@ namespace OpencodeGoProxy
 
         private static ProxyConfig ReadConfig(string path)
         {
-            if (!File.Exists(path)) throw new FileNotFoundException("Generated config file was not found.", path);
-            var config = Json.Deserialize<ProxyConfig>(File.ReadAllText(path, Encoding.UTF8));
+            string fullPath = Path.GetFullPath(path);
+            if (!File.Exists(fullPath)) throw new FileNotFoundException("Generated config file was not found.", fullPath);
+            var config = Json.Deserialize<ProxyConfig>(File.ReadAllText(fullPath, Encoding.UTF8));
             if (config == null || String.IsNullOrWhiteSpace(config.listen_prefix) ||
                 String.IsNullOrWhiteSpace(config.credential_source) ||
                 String.IsNullOrWhiteSpace(config.upstream_base_url) ||
@@ -456,6 +460,13 @@ namespace OpencodeGoProxy
                 String.IsNullOrWhiteSpace(config.public_model) ||
                 String.IsNullOrWhiteSpace(config.upstream_model))
                 throw new InvalidDataException("Generated config is missing a required setting.");
+            // Resolve relative credential_source against the config file's directory,
+            // so the proxy works from any working directory (e.g. launched hidden
+            // by a scheduled task whose CWD is System32).
+            if (!Path.IsPathRooted(config.credential_source))
+                config.credential_source = Path.Combine(Path.GetDirectoryName(fullPath) ?? ".", config.credential_source);
+            if (!String.IsNullOrEmpty(config.zen_credential_source) && !Path.IsPathRooted(config.zen_credential_source))
+                config.zen_credential_source = Path.Combine(Path.GetDirectoryName(fullPath) ?? ".", config.zen_credential_source);
             return config;
         }
 
@@ -465,7 +476,7 @@ namespace OpencodeGoProxy
             string text = new UTF8Encoding(false, true).GetString(bytes);
             var keys = text.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None)
                 .Select(line => line.Trim())
-                .Where(line => line.Length > 0)
+                .Where(line => line.Length > 0 && !line.StartsWith("#") && !line.StartsWith("//"))
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
             string hash;

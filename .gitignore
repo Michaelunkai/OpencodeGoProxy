@@ -1,9 +1,20 @@
-/OpencodeGoProxy.exe
-/SystemTray.exe
-/config.json
-/proxy.stdout.log
-/proxy.stderr.log
-/test-artifacts/
-/model-protocols.json
-/Logs/
+# Credentials
+api.txt
+api.txt.bak*
 
+# Build artifacts
+bin/
+obj/
+*.exe
+!OpencodeGoProxy.exe
+
+# Logs
+Logs/
+*.log
+
+# Protocols (learned at runtime)
+model-protocols.json
+
+# OS
+Thumbs.db
+Desktop.ini
