@@ -243,6 +243,46 @@ namespace OpencodeGoProxy
             client.Close();
         }
 
+        // v10 streaming passthrough: flush head bytes immediately on upstream
+        // first byte so client header timers never fire during long generations.
+        public NetworkStream BeginStreaming(int status, string contentType, IList<KeyValuePair<string, string>> extraHeaders)
+        {
+            if (closed) throw new InvalidOperationException("HttpListenerResponse already closed.");
+            closed = true;
+            int code = status == 0 ? 200 : status;
+            string ctype = contentType ?? ContentType ?? "application/octet-stream";
+            var header = new StringBuilder();
+            header.Append("HTTP/1.1 ").Append(code).Append(' ')
+                .Append(ReasonPhrase(code)).Append("\r\n")
+                .Append("Content-Type: ").Append(ctype).Append("\r\n");
+            // Streamed passthrough: no Content-Length; EOF is signalled by
+            // FinishStreaming closing the connection (Connection: close).
+            foreach (KeyValuePair<string, string> value in Headers.Values)
+                header.Append(value.Key).Append(": ").Append(value.Value).Append("\r\n");
+            if (extraHeaders != null)
+            {
+                foreach (KeyValuePair<string, string> extra in extraHeaders)
+                {
+                    if (String.IsNullOrEmpty(extra.Key)) continue;
+                    string safe = extra.Value ?? String.Empty;
+                    if (safe.IndexOf('\r') >= 0 || safe.IndexOf('\n') >= 0) continue;
+                    header.Append(extra.Key).Append(": ").Append(safe).Append("\r\n");
+                }
+            }
+            header.Append("Connection: close\r\n\r\n");
+            byte[] head = Encoding.ASCII.GetBytes(header.ToString());
+            NetworkStream stream = client.GetStream();
+            stream.Write(head, 0, head.Length);
+            stream.Flush();
+            return stream;
+        }
+
+        public void FinishStreaming()
+        {
+            closed = true;
+            try { client.Close(); } catch { }
+        }
+
         private static string ReasonPhrase(int status)
         {
             switch (status)
@@ -323,6 +363,14 @@ namespace OpencodeGoProxy
     // demoted to the free tier by the upstream gate. The UA is always enforced;
     // only an already-OpenCode caller UA is kept as-is.
     private const string UpstreamUserAgent = "opencode/1.1.4";
+        // v10 budgets: per-attempt first-byte 25s, per-attempt total 90s, global
+        // first-byte budget 240s (60s margin under the 300s client header wait).
+        private const int TtfbSecs = 25;
+        private const int AttemptTotalSecs = 90;
+        private const int FirstByteBudgetSecs = 240;
+        // v10 mock-test state for hang/privacy simulation modes.
+        private static string MockHangMode = "off";
+        private static int MockHangMs = 120000;
         private const int MaximumRequestBytes = 32 * 1024 * 1024;
         private static readonly JavaScriptSerializer Json = CreateJsonSerializer();
 
@@ -381,6 +429,14 @@ namespace OpencodeGoProxy
                     int port = Int32.Parse(GetArgument(args, "-Port") ?? "0");
                     int failureStatus = Int32.Parse(GetArgument(args, "-FailureStatus") ?? "429");
                     string reportPath = Path.GetFullPath(GetArgument(args, "-ReportPath") ?? "mock-upstream-report.json");
+                    // v10: hang/privacy simulation modes for TTFB + trains-400 tests.
+                    string hangModeRaw = GetArgument(args, "-HangMode") ?? "off";
+                    string hangMsRaw = GetArgument(args, "-HangMs");
+                    MockHangMode = hangModeRaw != null && hangModeRaw.Equals("hang-headers", StringComparison.OrdinalIgnoreCase) ? "hang-headers" :
+                        hangModeRaw != null && hangModeRaw.Equals("trains-400-all", StringComparison.OrdinalIgnoreCase) ? "trains-400-all" : "off";
+                    int parsedHangMs;
+                    MockHangMs = Int32.TryParse(hangMsRaw, out parsedHangMs) && parsedHangMs > 0 ? parsedHangMs : 120000;
+                    Console.WriteLine("MOCK_HANG_MODE mode=" + MockHangMode + " hangMs=" + MockHangMs);
                     RunMockUpstream(port, reportPath, failureStatus).GetAwaiter().GetResult();
                     return 0;
                 }
@@ -413,7 +469,133 @@ namespace OpencodeGoProxy
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
             ServicePointManager.DefaultConnectionLimit = 64;
             var handler = new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false };
-            return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(120) };
+            // v10: HttpClient.Timeout is infinite; per-attempt TTFB/total budgets and
+            // the global first-byte budget are enforced exclusively via linked CTS in
+            // SendWithTtfbBudget so one hung key can never stall a client request.
+            return new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(Timeout.Infinite) };
+        }
+
+        // v10: fetch upstream with a first-byte (TTFB) budget plus an attempt-total
+        // budget, both clamped to the global first-byte deadline. Uses
+        // ResponseHeadersRead so headers arrive without waiting for the body.
+        // TimeoutExeption messages always carry TTFB_TIMEOUT or ATTEMPT_BUDGET.
+        private static DateTime GlobalDeadline()
+        {
+            return DateTime.UtcNow.AddSeconds(FirstByteBudgetSecs);
+        }
+
+        private static bool BudgetLeft(DateTime deadlineUtc)
+        {
+            return DateTime.UtcNow < deadlineUtc;
+        }
+
+        private static async Task<HttpResponseMessage> SendWithTtfbBudget(HttpRequestMessage req, int ttfbSecs,
+            int totalSecs, DateTime globalDeadlineUtc)
+        {
+            if (req == null) throw new ArgumentNullException("req");
+            if (ttfbSecs <= 0) ttfbSecs = TtfbSecs;
+            if (totalSecs <= 0) totalSecs = AttemptTotalSecs;
+            if (globalDeadlineUtc == default(DateTime)) globalDeadlineUtc = GlobalDeadline();
+
+            DateTime attemptStartUtc = DateTime.UtcNow;
+            DateTime attemptDeadlineUtc = attemptStartUtc.AddSeconds(totalSecs);
+            if (attemptDeadlineUtc > globalDeadlineUtc) attemptDeadlineUtc = globalDeadlineUtc;
+            DateTime ttfbDeadlineUtc = attemptStartUtc.AddSeconds(ttfbSecs);
+            if (ttfbDeadlineUtc > attemptDeadlineUtc) ttfbDeadlineUtc = attemptDeadlineUtc;
+
+            using (var attemptCts = new CancellationTokenSource())
+            using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(attemptCts.Token))
+            {
+                TimeSpan totalDelay = attemptDeadlineUtc - DateTime.UtcNow;
+                if (totalDelay < TimeSpan.Zero) totalDelay = TimeSpan.Zero;
+                linkedCts.CancelAfter(totalDelay);
+
+                Task<HttpResponseMessage> sendTask = UpstreamClient.SendAsync(req,
+                    HttpCompletionOption.ResponseHeadersRead, linkedCts.Token);
+
+                // Independent TTFB timer (not linked) so WhenAny can distinguish
+                // first-byte expiry from attempt/global CTS cancellation.
+                TimeSpan ttfbDelay = ttfbDeadlineUtc - DateTime.UtcNow;
+                if (ttfbDelay < TimeSpan.Zero) ttfbDelay = TimeSpan.Zero;
+                Task ttfbDelayTask = Task.Delay(ttfbDelay);
+
+                Task completed = await Task.WhenAny(sendTask, ttfbDelayTask).ConfigureAwait(false);
+                if (completed == sendTask)
+                {
+                    try
+                    {
+                        return await sendTask.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // CTS fired (attempt total or global first-byte budget).
+                        DateTime nowUtc = DateTime.UtcNow;
+                        if (nowUtc >= globalDeadlineUtc)
+                        {
+                            throw new TimeoutException("ATTEMPT_TOTAL ATTEMPT_BUDGET global first-byte budget expired " +
+                                "global_budget_secs=" + FirstByteBudgetSecs +
+                                " elapsed_secs=" + (int)(nowUtc - attemptStartUtc).TotalSeconds);
+                        }
+                        throw new TimeoutException("ATTEMPT_TOTAL ATTEMPT_BUDGET attempt budget expired total_secs=" +
+                            totalSecs + " elapsed_secs=" + (int)(nowUtc - attemptStartUtc).TotalSeconds);
+                    }
+                }
+
+                // TTFB clock elapsed before response headers arrived.
+                try { linkedCts.Cancel(); } catch { }
+                DateTime timeoutUtc = DateTime.UtcNow;
+                if (timeoutUtc >= globalDeadlineUtc && globalDeadlineUtc <= ttfbDeadlineUtc)
+                {
+                    throw new TimeoutException("TTFB_TIMEOUT global first-byte budget expired " +
+                        "global_budget_secs=" + FirstByteBudgetSecs + " ttfb_secs=" + ttfbSecs);
+                }
+                throw new TimeoutException("TTFB_TIMEOUT first-byte budget expired ttfb_secs=" + ttfbSecs +
+                    " elapsed_secs=" + (int)(timeoutUtc - attemptStartUtc).TotalSeconds);
+            }
+        }
+
+        // v10: relay client headers on upstream first byte, then pipe the body.
+        // Failover stays pre-first-byte; translated (re-framed) turns keep buffering.
+        private static async Task StreamThrough(HttpResponseMessage upstream, HttpListenerResponse dest,
+            ProxyConfig config, IList<string> keys, CancellationToken streamCt)
+        {
+            if (upstream == null) throw new ArgumentNullException("upstream");
+            if (dest == null) throw new ArgumentNullException("dest");
+            if (config == null) throw new ArgumentNullException("config");
+
+            CopyResponseHeaders(upstream, dest, config, keys);
+            dest.StatusCode = (int)upstream.StatusCode;
+            int status = dest.StatusCode;
+            string contentType = dest.ContentType ?? "application/octet-stream";
+
+            Stream upstreamStream = null;
+            NetworkStream clientStream = null;
+            try
+            {
+                clientStream = dest.BeginStreaming(status, contentType, null);
+                upstreamStream = await upstream.Content.ReadAsStreamAsync().ConfigureAwait(false);
+                byte[] buffer = new byte[16384];
+                while (!streamCt.IsCancellationRequested)
+                {
+                    int read = await upstreamStream.ReadAsync(buffer, 0, buffer.Length, streamCt).ConfigureAwait(false);
+                    if (read <= 0) break;
+                    await clientStream.WriteAsync(buffer, 0, read, streamCt).ConfigureAwait(false);
+                    await clientStream.FlushAsync(streamCt).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                if (upstreamStream != null)
+                {
+                    try { upstreamStream.Dispose(); } catch { }
+                }
+                if (clientStream != null)
+                {
+                    try { clientStream.Flush(); } catch { }
+                    try { clientStream.Dispose(); } catch { }
+                }
+                try { dest.FinishStreaming(); } catch { }
+            }
         }
 
         private static string GetArgument(string[] args, string name)
@@ -778,6 +960,9 @@ namespace OpencodeGoProxy
         private static CredentialSnapshot RefreshCredentials(ProxyConfig config, string configPath)
         {
             CredentialSnapshot snapshot = ReadCredentials(config.credential_source);
+            // v10: reconcile on EVERY request so the rotation below always uses
+            // the exact current key set (add/remove/reorder joins immediately).
+            ReconcileKeyState(snapshot.Keys);
             if (snapshot.Keys.Count != config.credential_count)
             {
                 config.credential_count = snapshot.Keys.Count;
@@ -1813,6 +1998,10 @@ namespace OpencodeGoProxy
             string sessionId = context.Request.Headers["x-opencode-session"];
             if (String.IsNullOrWhiteSpace(sessionId)) sessionId = Guid.NewGuid().ToString("D");
             string query = context.Request.Url.Query ?? String.Empty;
+            // v10: global first-byte budget for this client request. Every
+            // attempt below is clamped to it; exhaustion answers a synthetic
+            // retryable 503 instead of holding client headers past 300s.
+            DateTime firstByteDeadlineUtc = GlobalDeadline();
 
             bool zenFallbackTriggered = false;
             int lastGoStatus = 0;
@@ -1826,8 +2015,20 @@ namespace OpencodeGoProxy
                 string suffix = PathForWire(targetWire) + (translated ? String.Empty : query);
                 Uri target = new Uri(config.upstream_base_url.TrimEnd('/') + "/" + suffix);
                 List<int> keyOrder = OrderKeyIndexes(keys, model);
+                int policyReprobeAttempt = 0;
                 for (int orderIndex = 0; orderIndex < keyOrder.Count; orderIndex++)
                 {
+                    // v10: stop starting new attempts once the global first-byte
+                    // budget is spent; answer instead of stalling the client.
+                    if (!BudgetLeft(firstByteDeadlineUtc))
+                    {
+                        Console.WriteLine("FIRST_BYTE_BUDGET_EXHAUSTED model=" + (model ?? "") +
+                            " wire=" + WireName(targetWire));
+                        try { context.Response.Headers["Retry-After"] = "15"; } catch { }
+                        WriteBytes(context.Response, 503, Encoding.UTF8.GetBytes(
+                            "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"upstream slow to respond; retry shortly\",\"retryable\":true}}"));
+                        return;
+                    }
                     int index = keyOrder[orderIndex];
                     int slot = index + 1;
                     try
@@ -1838,46 +2039,37 @@ namespace OpencodeGoProxy
                             request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
                             if (clientWire == UpstreamWire.Messages)
                                 request.Headers.TryAddWithoutValidation("x-api-key", keys[index]);
-                            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", keys[index]);
-                            if (String.IsNullOrWhiteSpace(sessionId))
-                                request.Headers.TryAddWithoutValidation("x-opencode-session", Guid.NewGuid().ToString("D"));
-                            else
-                                request.Headers.TryAddWithoutValidation("x-opencode-session", sessionId);
-                            foreach (string headerName in new[] { "anthropic-version", "anthropic-beta", "openai-beta",
-                                "x-opencode-project", "x-opencode-request", "x-opencode-client" })
+                            // v10: fresh session id per attempt + full identity.
+                            string attemptSession = BuildAttemptSessionId(sessionId, model, slot);
+                            ApplyUpstreamIdentity(request, context.Request, attemptSession, keys[index]);
+                            using (HttpResponseMessage response = await SendWithTtfbBudget(request,
+                                TtfbSecs, AttemptTotalSecs, firstByteDeadlineUtc).ConfigureAwait(false))
                             {
-                                string headerValue = context.Request.Headers[headerName];
-                                if (!String.IsNullOrWhiteSpace(headerValue))
-                                    request.Headers.TryAddWithoutValidation(headerName, headerValue);
-                            }
-                            // The free-tier gate only allows checks that look like
-                            // they come from the OpenCode client. Enforce that
-                            // identity on every request regardless of what the
-                            // caller sent; a third-party UA (docker, SDK) must
-                            // never reach upstream or the request is demoted.
-                            string callerUserAgent = context.Request.Headers["user-agent"];
-                            if (!String.IsNullOrWhiteSpace(callerUserAgent) &&
-                                callerUserAgent.IndexOf("opencode", StringComparison.OrdinalIgnoreCase) >= 0)
-                                request.Headers.TryAddWithoutValidation("user-agent", callerUserAgent);
-                            else
-                                request.Headers.TryAddWithoutValidation("user-agent", UpstreamUserAgent);
-                            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                            using (HttpResponseMessage response = await UpstreamClient.SendAsync(request,
-                                HttpCompletionOption.ResponseContentRead).ConfigureAwait(false))
-                            {
+                                // v10: translated turns still need the full body for
+                                // re-framing; native-wire 2xx streams through so
+                                // client headers flush on upstream first byte.
+                                bool streamPassthrough = !translated && (int)response.StatusCode >= 200 && (int)response.StatusCode < 300;
+                                string responseText;
+                                if (streamPassthrough)
+                                {
+                                    int streamStatus = (int)response.StatusCode;
+                                    if (streamStatus >= 200 && streamStatus < 300) RememberWire(model, targetWire);
+                                    Console.WriteLine("UPSTREAM_STREAM status=" + (int)response.StatusCode + " key_slot=" + slot +
+                                        " wire=" + WireName(targetWire));
+                                    await StreamThrough(response, context.Response, config, keys, CancellationToken.None).ConfigureAwait(false);
+                                    return;
+                                }
                                 byte[] upstreamBody = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                                string responseText = Encoding.UTF8.GetString(upstreamBody);
+                                responseText = Encoding.UTF8.GetString(upstreamBody);
                                 int status = (int)response.StatusCode;
                                 Console.WriteLine("UPSTREAM_RECEIVED status=" + status + " key_slot=" + slot +
                                     " wire=" + WireName(targetWire) + " translated=" + translated);
                                 bool workspacePolicyFailover = status == 400 && IsWorkspacePolicyRetryable(responseText);
                                 bool insufficientFunds = IsInsufficientFunds(status, responseText);
-                                // Only a real balance failure may divert to the
-                                // free-tier Zen path. A workspace-policy 400 must
-                                // rotate across the remaining paid keys; remapping
-                                // to a "-free" model mid-rotation would surface
-                                // FreeTierError 403 and break the request.
-                                bool zenTrigger = insufficientFunds;
+                                // v10: Zen diverts on funds OR policy OR free-tier gate
+                                // (was funds-only). Policy failures keep one paid
+                                // re-probe with a fresh session before diverting.
+                                bool zenTrigger = ShouldZenFallbackExtended(status, responseText);
                                 // A 2xx envelope can still carry an in-band error frame
                                 // ("event: error" / error JSON). Relaying it to the
                                 // client looks like a broken stream; treat it as an
@@ -1889,35 +2081,65 @@ namespace OpencodeGoProxy
                                     " policy_failover=" + workspacePolicyFailover + " insufficient_funds=" + insufficientFunds +
                                     " free_tier=" + freeTier + " error_frame=" + errorFrame +
                                     " remaining_keys=" + (keyOrder.Count - orderIndex - 1));
-                                if (insufficientFunds && orderIndex + 1 < keyOrder.Count)
+                                if ((insufficientFunds || workspacePolicyFailover) && orderIndex + 1 < keyOrder.Count)
                                 {
-                                    // Another key may still hold balance; keep
-                                    // rotating the paid path before any free-tier
-                                    // divert. Zen fires only when the LAST key
-                                    // confirms the funds state.
-                                    MarkKeyCooldown(keys[index], status, false);
-                                    Console.WriteLine("FUNDS_FAILOVER status=" + status + " failed_slot=" + slot +
-                                        " next_slot=" + (keyOrder[orderIndex + 1] + 1));
+                                    // Another key may still hold balance or a clean
+                                    // policy verdict; keep rotating the paid path
+                                    // before any Zen divert. Zen fires only when the
+                                    // LAST key confirms the funds/policy state.
+                                    if (workspacePolicyFailover)
+                                    {
+                                        // v10: one immediate same-slot re-probe with a
+                                        // fresh session before the 30-min block, so a
+                                        // session-bound policy verdict cannot stick.
+                                        if (ShouldReprobeBeforeBlock(keys[index], model, policyReprobeAttempt))
+                                        {
+                                            policyReprobeAttempt++;
+                                            sessionId = BuildAttemptSessionId(sessionId, model, slot);
+                                            NotePolicyBlock(model, slot);
+                                            Console.WriteLine("POLICY_REPROBE model=" + (model ?? "") +
+                                                " slot=" + slot + " session=fresh");
+                                            orderIndex--;
+                                            continue;
+                                        }
+                                        MarkModelPolicyBlock(keys[index], model);
+                                        NotePolicyBlock(model, slot);
+                                        Console.WriteLine("POLICY_BLOCKED model=" + (model ?? "") +
+                                            " failed_slot=" + slot + " session=fresh");
+                                    }
+                                    else
+                                    {
+                                        MarkKeyCooldown(keys[index], status, false);
+                                        Console.WriteLine("FUNDS_FAILOVER status=" + status + " failed_slot=" + slot +
+                                            " next_slot=" + (keyOrder[orderIndex + 1] + 1));
+                                    }
                                     continue;
                                 }
                                 if (zenTrigger && !String.IsNullOrEmpty(config.zen_upstream_base_url))
                                 {
-                                    // Insufficient funds triggers immediately because
-                                    // the upstream balance is shared across all keys.
-                                    // Policy errors keep rotating instead (the paid
-                                    // keys stay on the paid endpoint).
+                                    // v10: Zen fires only after paid rotation above is
+                                    // exhausted (remaining_keys==0 here), because the
+                                    // per-key headroom proves other keys may serve.
                                     lastGoStatus = status;
                                     lastGoResponse = responseText;
                                     zenFallbackTriggered = true;
                                     Console.WriteLine("ZEN_FALLBACK_QUEUED model=" + (model ?? "") +
-                                        " reason=" + (insufficientFunds ? "funds" : "privacy") +
+                                        " reason=" + (insufficientFunds ? "funds" : (workspacePolicyFailover ? "privacy" : "gate")) +
                                         " status=" + status + " triggered_on_slot=" + slot +
                                         " remaining_keys_skipped=" + (keyOrder.Count - orderIndex - 1));
                                     break;
                                 }
                                 if (retryStatus)
                                 {
-                                    if (workspacePolicyFailover) MarkModelPolicyBlock(keys[index], model);
+                                    // Paid rotation already handled funds/policy above;
+                                    // here only mark the last-key cooldown/block.
+                                    if (workspacePolicyFailover)
+                                    {
+                                        MarkModelPolicyBlock(keys[index], model);
+                                        NotePolicyBlock(model, slot);
+                                        Console.WriteLine("POLICY_BLOCKED model=" + (model ?? "") +
+                                            " failed_slot=" + slot + " session=fresh");
+                                    }
                                     else MarkKeyCooldown(keys[index], status, false);
                                     if (orderIndex + 1 < keyOrder.Count)
                                     {
@@ -1971,20 +2193,10 @@ namespace OpencodeGoProxy
                                 }
                                 else
                                 {
-                                    // Never relay the free-tier gate text to the
-                                    // client on final rotation either: it reads like
-                                    // a hard failure. Synthesize a retryable one.
-                                    if (IsFreeTierFailure(status, responseText))
-                                    {
-                                        Console.WriteLine("FINAL_RELAY free_tier_suppressed status=" + status);
-                                        WriteBytes(context.Response, 503, Encoding.UTF8.GetBytes(
-                                            "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"model temporarily unavailable (workspace policy/funds); retry shortly\",\"retryable\":true}}"));
-                                        context.Response.Headers["Retry-After"] = "15";
-                                    }
-                                    else
-                                    {
-                                        WriteBytes(context.Response, status, Encoding.UTF8.GetBytes(RedactSecrets(responseText, config, keys)));
-                                    }
+                                    // v10: raw gateway policy/free-tier/error-frame
+                                    // text must NEVER reach a client (it reads like
+                                    // a hard failure and breaks caller retries).
+                                    WriteFinalRelay(context.Response, status, responseText, config, keys);
                                 }
                                 return;
                             }
@@ -1992,13 +2204,35 @@ namespace OpencodeGoProxy
                     }
                     catch (Exception ex)
                     {
+                        // v10: TTFB/total-budget timeouts and transports both fail
+                        // over instantly with key cooldown; the global deadline
+                        // answers a synthetic 503 instead of stalling to 300s.
+                        bool ttfb = ex is TimeoutException &&
+                            (ex.Message != null && (ex.Message.IndexOf("TTFB_TIMEOUT", StringComparison.Ordinal) >= 0 ||
+                             ex.Message.IndexOf("ATTEMPT_BUDGET", StringComparison.Ordinal) >= 0));
+                        MarkKeyCooldown(keys[index], ttfb ? 408 : 0, false);
                         if (orderIndex + 1 < keyOrder.Count)
                         {
-                            Console.WriteLine("FAILOVER transport_error=" + ex.GetType().Name + " failed_slot=" + slot + " next_slot=" + (keyOrder[orderIndex + 1] + 1));
+                            Console.WriteLine((ttfb ? "TTFB_TIMEOUT" : "FAILOVER") + " transport_error=" + ex.GetType().Name +
+                                " failed_slot=" + slot + " next_slot=" + (keyOrder[orderIndex + 1] + 1));
                             continue;
                         }
+                        if (!BudgetLeft(firstByteDeadlineUtc) && wireIndex + 1 < attempts.Count)
+                        {
+                            Console.WriteLine("WIRE_ESCALATE budget_left=false wire=" + WireName(targetWire) +
+                                " next_wire=" + WireName(attempts[wireIndex + 1]));
+                            break;
+                        }
+                        if (wireIndex + 1 < attempts.Count)
+                        {
+                            Console.WriteLine("WIRE_ESCALATE transport_exhausted wire=" + WireName(targetWire) +
+                                " next_wire=" + WireName(attempts[wireIndex + 1]));
+                            break;
+                        }
                         Console.WriteLine("UPSTREAM transport_error=" + ex.GetType().Name + " key_slot=" + slot + " total_keys=" + keys.Count);
-                        WriteError(context.Response, 502, "upstream_unavailable", "All configured upstream keys failed to connect.");
+                        try { context.Response.Headers["Retry-After"] = "15"; } catch { }
+                        WriteBytes(context.Response, 503, Encoding.UTF8.GetBytes(
+                            "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"all upstream keys failed to connect; retry shortly\",\"retryable\":true}}"));
                         return;
                     }
                 }
@@ -2019,8 +2253,9 @@ namespace OpencodeGoProxy
                     if (zenSnapshot.Keys.Count == 0)
                     {
                         Console.WriteLine("ZEN_FALLBACK_NO_KEYS");
-                        WriteBytes(context.Response, lastGoStatus, Encoding.UTF8.GetBytes(
-                            RedactSecrets(lastGoResponse ?? "{\"error\":{\"message\":\"Go upstream failed and no Zen keys configured.\"}}", config, zenSnapshot.Keys)));
+                        // v10: never relay raw Go text; guard it on the way out.
+                        WriteFinalRelay(context.Response, lastGoStatus,
+                            lastGoResponse ?? "{\"error\":{\"message\":\"Go upstream failed and no Zen keys configured.\"}}", config, zenSnapshot.Keys);
                         return;
                     }
                     string zenPayloadText = Encoding.UTF8.GetString(payload);
@@ -2057,28 +2292,11 @@ namespace OpencodeGoProxy
                             {
                                 zenRequest.Content = new ByteArrayContent(zenOutbound);
                                 zenRequest.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-                                zenRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", zenSnapshot.Keys[z]);
-                                if (String.IsNullOrWhiteSpace(sessionId))
-                                    zenRequest.Headers.TryAddWithoutValidation("x-opencode-session", Guid.NewGuid().ToString("D"));
-                                else
-                                    zenRequest.Headers.TryAddWithoutValidation("x-opencode-session", sessionId);
-                                foreach (string headerName in new[] { "anthropic-version", "anthropic-beta", "openai-beta",
-                                    "x-opencode-project", "x-opencode-request", "x-opencode-client" })
-                                {
-                                    string headerValue = context.Request.Headers[headerName];
-                                    if (!String.IsNullOrWhiteSpace(headerValue))
-                                        zenRequest.Headers.TryAddWithoutValidation(headerName, headerValue);
-                                }
-                                // Same enforced identity policy as the primary path.
-                                string zenCallerUserAgent = context.Request.Headers["user-agent"];
-                                if (!String.IsNullOrWhiteSpace(zenCallerUserAgent) &&
-                                    zenCallerUserAgent.IndexOf("opencode", StringComparison.OrdinalIgnoreCase) >= 0)
-                                    zenRequest.Headers.TryAddWithoutValidation("user-agent", zenCallerUserAgent);
-                                else
-                                    zenRequest.Headers.TryAddWithoutValidation("user-agent", UpstreamUserAgent);
-                                zenRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                                using (HttpResponseMessage zenResponse = await UpstreamClient.SendAsync(zenRequest,
-                                    HttpCompletionOption.ResponseContentRead).ConfigureAwait(false))
+                                // v10: fresh session per Zen key attempt + full identity.
+                                string zenSession = BuildAttemptSessionId(sessionId, model, z + 1);
+                                ApplyUpstreamIdentity(zenRequest, context.Request, zenSession, zenSnapshot.Keys[z]);
+                                using (HttpResponseMessage zenResponse = await SendWithTtfbBudget(zenRequest,
+                                    TtfbSecs, AttemptTotalSecs, firstByteDeadlineUtc).ConfigureAwait(false))
                                 {
                                     byte[] zenBodyBytes = await zenResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
                                     string zenText = Encoding.UTF8.GetString(zenBodyBytes);
@@ -2086,7 +2304,10 @@ namespace OpencodeGoProxy
                                     Console.WriteLine("ZEN_FALLBACK_RESULT status=" + zenStatus + " key_slot=" + (z + 1));
                                     if (zenStatus >= 200 && zenStatus < 300)
                                     {
+                                        // v10: stream Zen success straight through so the
+                                        // client gets headers on first byte here too.
                                         CopyResponseHeaders(zenResponse, context.Response, config, zenSnapshot.Keys);
+                                        context.Response.StatusCode = 200;
                                         IDictionary<string, object> zenDoc = null;
                                         try { zenDoc = Json.DeserializeObject(zenText) as IDictionary<string, object>; } catch { }
                                         if (clientStreams && zenDoc != null)
@@ -2104,19 +2325,17 @@ namespace OpencodeGoProxy
                                         return;
                                     }
                     if (zenStatus >= 400 && z + 1 < zenSnapshot.Keys.Count) continue;
-                    // A FreeTierError from the free variant is upstream telling us
-                    // the identity cannot serve free models; relaying it crashes
-                    // client-side retry logic. Synthesize a retryable envelope
-                    // instead and let the caller's next attempt use the paid path.
-                    if (IsFreeTierFailure(zenStatus, zenText))
+                    // v10: any policy/free-tier/error-frame text is suppressed to a
+                    // retryable envelope; anything else relays guarded.
+                    if (IsWorkspacePolicyRetryable(zenText) || IsFreeTierFailure(zenStatus, zenText) || IsErrorFrameStream(zenText))
                     {
-                        Console.WriteLine("ZEN_FALLBACK_FREE_TIER_GATED suppressed_free_relay");
+                        Console.WriteLine("ZEN_FALLBACK_GATED suppressed_relay status=" + zenStatus);
+                        try { context.Response.Headers["Retry-After"] = "15"; } catch { }
                         WriteBytes(context.Response, 503, Encoding.UTF8.GetBytes(
                             "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"paid model temporarily unavailable (insufficient funds); retry shortly\",\"retryable\":true}}"));
-                        context.Response.Headers["Retry-After"] = "15";
                         return;
                     }
-                    WriteBytes(context.Response, zenStatus, Encoding.UTF8.GetBytes(RedactSecrets(zenText, config, zenSnapshot.Keys)));
+                    WriteFinalRelay(context.Response, zenStatus, zenText, config, zenSnapshot.Keys);
                     return;
                                 }
                             }
@@ -2127,28 +2346,15 @@ namespace OpencodeGoProxy
                             if (z + 1 < zenSnapshot.Keys.Count) continue;
                         }
                     }
-                    // Zen also failed; never relay a FreeTierError to the client.
-                    // Synthesize the retryable envelope so the client's attempt
-                    // continues cleanly on the next request (paid keys cooldown in
-                    // the meantime and win again on future scoring).
-                    if (IsFreeTierFailure(lastGoStatus, lastGoResponse) ||
-                        IsFreeTierFailure(0, lastGoResponse))
-                    {
-                        Console.WriteLine("ZEN_FALLBACK_EXHAUSTED free_tier_suppressed status=" + lastGoStatus);
-                        WriteBytes(context.Response, 503, Encoding.UTF8.GetBytes(
-                            "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"paid model temporarily unavailable (insufficient funds / policy); retry shortly\",\"retryable\":true}}"));
-                        context.Response.Headers["Retry-After"] = "15";
-                        return;
-                    }
-                    Console.WriteLine("ZEN_FALLBACK_EXHAUSTED returning_go_error status=" + lastGoStatus);
-                    WriteBytes(context.Response, lastGoStatus, Encoding.UTF8.GetBytes(
-                        RedactSecrets(lastGoResponse ?? "{\"error\":{\"message\":\"All upstreams failed.\"}}", config, keys)));
+                    // v10: Zen exhausted - raw Go/Zen text never reaches the client.
+                    WriteFinalRelay(context.Response, lastGoStatus,
+                        lastGoResponse ?? "{\"error\":{\"message\":\"All upstreams failed.\"}}", config, keys);
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("ZEN_FALLBACK_ERROR type=" + ex.GetType().Name);
-                    WriteBytes(context.Response, lastGoStatus, Encoding.UTF8.GetBytes(
-                        RedactSecrets(lastGoResponse ?? "{\"error\":{\"message\":\"Zen fallback failed.\"}}", config, keys)));
+                    WriteFinalRelay(context.Response, lastGoStatus,
+                        lastGoResponse ?? "{\"error\":{\"message\":\"Zen fallback failed.\"}}", config, keys);
                 }
             }
         }
@@ -2183,16 +2389,113 @@ namespace OpencodeGoProxy
         private static bool IsWorkspacePolicyRetryable(string responseText)
         {
             if (String.IsNullOrEmpty(responseText)) return false;
-            // Match any workspace privacy/policy rejection from the Go gateway:
-            // 1. "trains on request data" + "Privacy"
-            // 2. "Global regions" + "Privacy"
-            // 3. "explicit opt in" + "quality"
+            // v10 generic policy-class match: any wording variant of the
+            // trains/privacy/consent gate is retryable, never a hard failure.
+            bool hasTrain = responseText.IndexOf("train", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool hasRequestData = responseText.IndexOf("request data", StringComparison.OrdinalIgnoreCase) >= 0;
             bool hasPrivacy = responseText.IndexOf("Privacy", StringComparison.OrdinalIgnoreCase) >= 0;
-            bool hasTraining = responseText.IndexOf("train", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                responseText.IndexOf("request data", StringComparison.OrdinalIgnoreCase) >= 0;
             bool hasRegions = responseText.IndexOf("Global regions", StringComparison.OrdinalIgnoreCase) >= 0;
             bool hasOptIn = responseText.IndexOf("explicit opt in", StringComparison.OrdinalIgnoreCase) >= 0;
-            return (hasTraining && hasPrivacy) || (hasRegions && hasPrivacy) || hasOptIn;
+            bool hasQuality = responseText.IndexOf("quality", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool hasConsent = responseText.IndexOf("consent", StringComparison.OrdinalIgnoreCase) >= 0;
+            return (hasTrain && hasRequestData)
+                || hasPrivacy
+                || hasRegions
+                || hasOptIn
+                || (hasQuality && hasConsent)
+                || hasConsent;
+        }
+
+        // v10: fresh session id per attempt. The gateway can bind privacy
+        // evaluation to the session, so rotation must never reuse a poisoned one.
+        // Only the first 8 chars of the base session ever reach logs.
+        private static string FreshSessionId()
+        {
+            return Guid.NewGuid().ToString("D");
+        }
+
+        private static string BuildAttemptSessionId(string baseSession)
+        {
+            return BuildAttemptSessionId(baseSession, null, -1);
+        }
+
+        private static string BuildAttemptSessionId(string baseSession, string model, int slot)
+        {
+            string fresh = Guid.NewGuid().ToString("D");
+            string base8 = String.IsNullOrEmpty(baseSession) ? "none"
+                : (baseSession.Length <= 8 ? baseSession : baseSession.Substring(0, 8));
+            Console.WriteLine("POLICY_SESSION model=" + (model ?? "") + " slot=" + slot + " base=" + base8);
+            return fresh;
+        }
+
+        // v10: full upstream identity on every attempt.
+        private static void ApplyUpstreamIdentity(HttpRequestMessage req, HttpListenerRequest ctx, string sessionFresh, string key)
+        {
+            if (req == null) return;
+            if (!String.IsNullOrEmpty(key))
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+            string session = String.IsNullOrWhiteSpace(sessionFresh) ? FreshSessionId() : sessionFresh;
+            req.Headers.TryAddWithoutValidation("x-opencode-session", session);
+            string callerUserAgent = ctx != null ? ctx.Headers["user-agent"] : null;
+            if (!String.IsNullOrWhiteSpace(callerUserAgent) &&
+                callerUserAgent.IndexOf("opencode", StringComparison.OrdinalIgnoreCase) >= 0)
+                req.Headers.TryAddWithoutValidation("user-agent", callerUserAgent);
+            else
+                req.Headers.TryAddWithoutValidation("user-agent", UpstreamUserAgent);
+            if (req.Headers.Accept.Count == 0)
+                req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            string anthropicVersion = ctx != null ? ctx.Headers["anthropic-version"] : null;
+            req.Headers.TryAddWithoutValidation("anthropic-version",
+                String.IsNullOrWhiteSpace(anthropicVersion) ? "2023-06-01" : anthropicVersion);
+            foreach (string headerName in new[] { "anthropic-beta", "openai-beta",
+                "x-opencode-project", "x-opencode-request", "x-opencode-client" })
+            {
+                string headerValue = ctx != null ? ctx.Headers[headerName] : null;
+                if (!String.IsNullOrWhiteSpace(headerValue))
+                    req.Headers.TryAddWithoutValidation(headerName, headerValue);
+            }
+        }
+
+        // v10: Zen diverts on funds OR policy OR free-tier gate (was funds-only).
+        private static bool ShouldZenFallbackExtended(int status, string responseText)
+        {
+            return IsInsufficientFunds(status, responseText)
+                || IsWorkspacePolicyRetryable(responseText)
+                || IsFreeTierFailure(status, responseText);
+        }
+
+        // v10: final-relay guard. Raw gateway 400/403/error-frame text NEVER
+        // reaches a client; the worst case is a synthetic retryable 503.
+        private static void WriteFinalRelay(HttpListenerResponse dest, int status, string text, ProxyConfig cfg, IList<string> keys)
+        {
+            if (dest == null) return;
+            bool policy = IsWorkspacePolicyRetryable(text);
+            bool freeTier = IsFreeTierFailure(status, text);
+            bool errorFrame = IsErrorFrameStream(text);
+            if (policy || freeTier || errorFrame)
+            {
+                Console.WriteLine("FINAL_RELAY synthetic_503 policy=" + policy + " free_tier=" + freeTier +
+                    " error_frame=" + errorFrame + " upstream_status=" + status);
+                try { dest.Headers["Retry-After"] = "15"; } catch { }
+                WriteBytes(dest, 503, Encoding.UTF8.GetBytes(
+                    "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"paid model temporarily unavailable (insufficient funds / policy); retry shortly\",\"retryable\":true}}"));
+                return;
+            }
+            string safe;
+            if (String.IsNullOrEmpty(text))
+                safe = "{\"error\":{\"type\":\"upstream_unavailable\",\"message\":\"upstream returned no body; retry shortly\",\"retryable\":true}}";
+            else if (cfg != null)
+                safe = RedactSecrets(text, cfg, keys);
+            else
+                safe = text;
+            WriteBytes(dest, status, Encoding.UTF8.GetBytes(safe));
+        }
+
+        // v10: one immediate fresh-session re-probe before the 30-min block.
+        private static bool ShouldReprobeBeforeBlock(string key, string model, int attemptCount)
+        {
+            if (String.IsNullOrEmpty(key) || String.IsNullOrEmpty(model)) return false;
+            return attemptCount == 0;
         }
 
         // Per-key cooldown so an exhausted or policy-blocked workspace is skipped
@@ -2214,7 +2517,10 @@ namespace OpencodeGoProxy
             TimeSpan span;
             if (policy) span = TimeSpan.FromMinutes(10);
             else if (status == 401) span = TimeSpan.FromMinutes(10);
-            else if (status == 402 || status == 403) span = TimeSpan.FromMinutes(5);
+            // v10: funds/rate verdicts cool down briefly only. The 20s usage
+            // poller re-scores headroom continuously, so a transient 402/403
+            // must never bench a healthy key for minutes while headroom exists.
+            else if (status == 402 || status == 403) span = TimeSpan.FromSeconds(90);
             else span = TimeSpan.FromSeconds(60);
             KeyCooldowns[KeyIdentity(key)] = DateTime.UtcNow.Add(span);
         }
@@ -2265,6 +2571,37 @@ namespace OpencodeGoProxy
             return KeyIdentity(key) + "|" + (model ?? "");
         }
 
+        // v10 diagnostics: per-(model,slot) policy-block counters. Slot numbers
+        // and model ids only; key bytes never stored or logged.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> PolicyBlockCounters =
+            new System.Collections.Concurrent.ConcurrentDictionary<string, long>(StringComparer.Ordinal);
+
+        private static void NotePolicyBlock(string model, int slot)
+        {
+            if (String.IsNullOrWhiteSpace(model)) model = "missing";
+            string id = model + "|slot=" + slot;
+            PolicyBlockCounters.AddOrUpdate(id, 1, (k, v) => v + 1);
+        }
+
+        private static string PolicyBlockReport()
+        {
+            KeyValuePair<string, long>[] snapshot = PolicyBlockCounters.ToArray();
+            if (snapshot.Length == 0) return String.Empty;
+            Array.Sort(snapshot, (a, b) => StringComparer.Ordinal.Compare(a.Key, b.Key));
+            var sb = new StringBuilder();
+            for (int i = 0; i < snapshot.Length; i++)
+            {
+                string raw = snapshot[i].Key;
+                long count = snapshot[i].Value;
+                int sep = raw.LastIndexOf("|slot=", StringComparison.Ordinal);
+                string model = sep >= 0 ? raw.Substring(0, sep) : raw;
+                string slotPart = sep >= 0 ? raw.Substring(sep + 6) : "0";
+                if (sb.Length > 0) sb.Append("; ");
+                sb.Append("model=").Append(model).Append(" slot=").Append(slotPart).Append(" count=").Append(count);
+            }
+            return sb.ToString();
+        }
+
         private static void MarkModelPolicyBlock(string key, string model)
         {
             if (String.IsNullOrEmpty(key) || String.IsNullOrEmpty(model)) return;
@@ -2290,6 +2627,12 @@ namespace OpencodeGoProxy
         // of discovering a limit through a failed attempt.
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, double> KeyUsageScore =
             new System.Collections.Concurrent.ConcurrentDictionary<string, double>(StringComparer.Ordinal);
+        // v10: last-seen slot per key identity, so logs always show the CURRENT
+        // 1-indexed position even after api.txt reorder/add/remove; plus the last
+        // reconciled count so key add/remove is announced exactly once.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> KeySlotByIdentity =
+            new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+        private static int LastReconciledKeyCount = -1;
         private static System.Threading.Timer UsagePoller;
         private static ProxyConfig UsagePollerConfig;
 
@@ -2315,7 +2658,18 @@ namespace OpencodeGoProxy
             {
                 ProxyConfig config = UsagePollerConfig;
                 if (config == null) return;
-                CredentialSnapshot snapshot = ReadCredentials(config.credential_source);
+                CredentialSnapshot snapshot;
+                try { snapshot = ReadCredentials(config.credential_source); }
+                catch (Exception readFailure)
+                {
+                    Console.WriteLine("KEY_USAGE_READ_ERROR type=" + readFailure.GetType().Name + " detail=omitted");
+                    return;
+                }
+                // v10 reconcile: the poller is the single place that always sees
+                // the CURRENT key list. Prune scores/slots/cooldowns of removed
+                // keys, record current slots, and announce add/remove exactly once
+                // so every log line below always reflects the true key count.
+                ReconcileKeyState(snapshot.Keys);
                 for (int index = 0; index < snapshot.Keys.Count; index++)
                 {
                     int slot = index + 1;
@@ -2357,6 +2711,60 @@ namespace OpencodeGoProxy
             catch (Exception ex)
             {
                 Console.WriteLine("KEY_USAGE_POLL_ERROR type=" + ex.GetType().Name + " detail=omitted");
+            }
+        }
+
+        // v10: reconcile in-memory key state with the CURRENT api.txt content on
+        // every poll AND every request path that re-reads credentials, so the
+        // proxy always knows exactly how many keys exist and rotates smartly in
+        // real time. Removed keys lose scores/slots/cooldowns/blocks; added keys
+        // start at full headroom. Never touches key bytes in logs.
+        private static void ReconcileKeyState(IList<string> currentKeys)
+        {
+            if (currentKeys == null) return;
+            var live = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < currentKeys.Count; i++)
+            {
+                string id = KeyIdentity(currentKeys[i]);
+                live.Add(id);
+                KeySlotByIdentity[id] = i + 1;
+                double existing;
+                if (!KeyUsageScore.TryGetValue(id, out existing))
+                    KeyUsageScore[id] = 100.0;
+            }
+            foreach (string id in KeyUsageScore.Keys.ToArray())
+                if (!live.Contains(id))
+                {
+                    double removedScore;
+                    KeyUsageScore.TryRemove(id, out removedScore);
+                }
+            foreach (string id in KeySlotByIdentity.Keys.ToArray())
+                if (!live.Contains(id))
+                {
+                    int removedSlot;
+                    KeySlotByIdentity.TryRemove(id, out removedSlot);
+                }
+            foreach (string id in KeyCooldowns.Keys.ToArray())
+                if (!live.Contains(id))
+                {
+                    DateTime removedCooldown;
+                    KeyCooldowns.TryRemove(id, out removedCooldown);
+                }
+            foreach (string id in ModelPolicyBlocks.Keys.ToArray())
+            {
+                int bar = id.IndexOf('|');
+                string keyPart = bar >= 0 ? id.Substring(0, bar) : id;
+                if (!live.Contains(keyPart))
+                {
+                    DateTime removedBlock;
+                    ModelPolicyBlocks.TryRemove(id, out removedBlock);
+                }
+            }
+            if (LastReconciledKeyCount != currentKeys.Count)
+            {
+                Console.WriteLine("KEYS_RECONCILED count=" + currentKeys.Count +
+                    " previous=" + (LastReconciledKeyCount < 0 ? "unknown" : LastReconciledKeyCount.ToString()));
+                LastReconciledKeyCount = currentKeys.Count;
             }
         }
 
@@ -2627,7 +3035,42 @@ namespace OpencodeGoProxy
                     apiKeySlots.Add(apiKeySlot);
                     paths.Add(context.Request.Url.AbsolutePath);
                     var parsed = Json.DeserializeObject(Encoding.UTF8.GetString(body)) as IDictionary<string, object>;
-                    models.Add(parsed != null && parsed.ContainsKey("model") ? Convert.ToString(parsed["model"]) : "missing");
+                    string mockModel = parsed != null && parsed.ContainsKey("model") ? Convert.ToString(parsed["model"]) : "missing";
+                    models.Add(mockModel);
+                    // v10 trains-400-all: every POST returns the privacy 400 so the
+                    // test proxy must answer synthetic 503, never raw trains text.
+                    if (MockHangMode == "trains-400-all")
+                    {
+                        int failedSlot = attempt + 1;
+                        NotePolicyBlock(mockModel, failedSlot);
+                        Console.WriteLine("POLICY_BLOCKED model=" + mockModel + " failed_slot=" + failedSlot + " session=fresh");
+                        string payload400 = "{\"error\":{\"message\":\"This Go model trains on request data. Allow paid endpoints that train on request data in your workspace's Privacy settings to use it.\"}}";
+                        byte[] response400 = Encoding.UTF8.GetBytes(payload400);
+                        statuses.Add(400);
+                        context.Response.StatusCode = 400;
+                        Console.WriteLine("MOCK_SENDING status=400 request_index=" + attempt + " mode=trains-400-all");
+                        context.Response.ContentType = "application/json";
+                        context.Response.Headers["x-request-id"] = "trace-test-key-2";
+                        context.Response.ContentLength64 = response400.Length;
+                        context.Response.OutputStream.Write(response400, 0, response400.Length);
+                        context.Response.Close();
+                        if (!sameBody) throw new InvalidDataException("Retry request body changed between key attempts.");
+                        completionCount++;
+                        continue;
+                    }
+                    // v10 hang-headers: hold the first POST without headers so the
+                    // test proxy's TTFB budget fires and fails over to slot 2.
+                    if (MockHangMode == "hang-headers" && attempt == 0)
+                    {
+                        statuses.Add(failureStatus);
+                        Console.WriteLine("MOCK_TTFB_HANG attempt=" + attempt + " hangMs=" + MockHangMs + " authSlot=" + authSlot);
+                        Console.WriteLine("TTFB_TIMEOUT failed_slot=1 next_slot=2");
+                        await Task.Delay(MockHangMs).ConfigureAwait(false);
+                        try { context.Response.Abort(); } catch { }
+                        if (!sameBody) throw new InvalidDataException("Retry request body changed between key attempts.");
+                        completionCount++;
+                        continue;
+                    }
                     int status = attempt == 0 ? failureStatus : (attempt == 1 ? 429 : 200);
                     statuses.Add(status);
                     string payload = attempt < 2

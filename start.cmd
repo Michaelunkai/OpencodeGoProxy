@@ -2,9 +2,7 @@
 :: OpenCode Go Proxy - Silent Launcher (prefers newest hard-built binary)
 set "DIR=%~dp0"
 set "EXE=%DIR%OpencodeGoProxy.exe"
-if exist "%DIR%OpencodeGoProxy_v4.exe" set "EXE=%DIR%OpencodeGoProxy_v4.exe"
-if not exist "%DIR%OpencodeGoProxy_v4.exe" if exist "%DIR%OpencodeGoProxy_v3.exe" set "EXE=%DIR%OpencodeGoProxy_v3.exe"
-if not exist "%DIR%OpencodeGoProxy_v4.exe" if not exist "%DIR%OpencodeGoProxy_v3.exe" if exist "%DIR%OpencodeGoProxy_v2.exe" set "EXE=%DIR%OpencodeGoProxy_v2.exe"
+if exist "%DIR%OpencodeGoProxy_v10_1.exe" set "EXE=%DIR%OpencodeGoProxy_v10_1.exe"
 set "CFG=%DIR%config.json"
 set "LOG=%DIR%Logs"
 if not exist "%LOG%" mkdir "%LOG%"
