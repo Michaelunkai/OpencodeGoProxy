@@ -27,13 +27,20 @@ short universal instructions with MCP directory. Env override fixed to
 RESPONSES_OK (muse-spark-1.3-contributor), MESSAGES_OK (qwen3.8-flash).
 Estimate: ~60% fewer billed tokens (55-70% range) on every task/model.
 
-## Quick Start (Fresh Windows)
+## Quick Start (any Windows PC, zero steps)
 
-1. Copy this folder anywhere
-2. Add your API keys to `api.txt` (one per line)
-3. Double-click `OpencodeGoProxy.exe`
+1. Download `OpencodeGoProxy-portable-vX.Y.Z.zip` from the
+   [latest release](https://github.com/Michaelunkai/OpencodeGoProxy/releases/latest)
+   and extract it anywhere
+2. Double-click **`setup.cmd`** — it creates `api.txt` (paste one OpenCode Go
+   key per line), generates `config.json` with a fresh local key, registers
+   the invisible logon task, installs the `:4000` bridge, starts the proxy,
+   and proves both health endpoints
+3. Point any OpenAI-compatible client at `http://127.0.0.1:4001/v1`
 
-That's it. Zero configuration needed. The proxy auto-starts at Windows logon via a scheduled task.
+That's it. No install, no admin (except the optional `:4000` bridge), no
+terminal frames ever — one tray icon. The proxy repairs itself on every
+start, so the folder can be copied to any path on any machine.
 
 ## Features
 
@@ -89,8 +96,10 @@ Latest run: `RESULT passes=5 failures=0`
 | File | Purpose |
 |------|---------|
 | `OpencodeGoProxy.exe` | The proxy (self-contained, no install needed) |
-| `config.json` | Configuration (defaults work out of the box) |
-| `api.txt` | Your API keys (create this file, one per line) |
+| `setup.cmd` | Zero-step setup: keys, config, logon task, bridge, start, verify |
+| `config.default.json` | Portable defaults (copied to `config.json` on first run) |
+| `api.txt` | Your API keys (created for you, one per line) |
+| `run-hidden.vbs` / `start.cmd` / `stop.cmd` | Portable launchers (work at any path) |
 | `build.ps1` | Rebuild from source |
 
 ## Configuration

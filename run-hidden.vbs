@@ -1,5 +1,10 @@
-' OpenCode Go Proxy - invisible launcher.
-' Launches the GUI-subsystem exe with no window of any kind. The proxy's
-' EnsureSelfSetup registers this VBS as the ONLOGON task automatically, so a
-' fresh boot brings the tray icon up with zero terminal/popup frames.
-CreateObject("WScript.Shell").Run """F:\study\Windows\Applications\PowerShell\Automation\OpenCode\Projects\OpencodeGoProxy\OpencodeGoProxy_v10_1.exe"" -Mode Serve -ConfigPath ""F:\study\Windows\Applications\PowerShell\Automation\OpenCode\Projects\OpencodeGoProxy\config.json""", 0, False
+' OpenCode Go Proxy - invisible launcher (PORTABLE).
+' Resolves the exe + config next to THIS script, so the folder works on any
+' machine at any path. setup.cmd registers this VBS as the ONLOGON task;
+' the exe's EnsureSelfSetup keeps it registered automatically afterwards.
+Dim shell, here, exe, cfg
+Set shell = CreateObject("WScript.Shell")
+here = Left(WScript.ScriptFullName, InStrRev(WScript.ScriptFullName, "\"))
+exe = here & "OpencodeGoProxy.exe"
+cfg = here & "config.json"
+shell.Run """" & exe & """ -Mode Serve -ConfigPath """ & cfg & """", 0, False

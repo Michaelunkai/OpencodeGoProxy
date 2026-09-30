@@ -680,7 +680,8 @@ namespace OpencodeGoProxy
                 String.IsNullOrWhiteSpace(config.upstream_base_url) ||
                 String.IsNullOrWhiteSpace(config.local_api_key) ||
                 String.IsNullOrWhiteSpace(config.public_model) ||
-                String.IsNullOrWhiteSpace(config.upstream_model))
+                String.IsNullOrWhiteSpace(config.upstream_model) ||
+                config.local_api_key == "REPLACE_ON_FIRST_RUN")
                 throw new InvalidDataException("Generated config is missing a required setting.");
             // Resolve relative credential_source against the config file's directory,
             // so the proxy works from any working directory (e.g. launched hidden
@@ -727,10 +728,11 @@ namespace OpencodeGoProxy
             return preferred;
         }
 
-        // Self-healing setup: on a fresh Windows, running the proxy once makes it
-        // permanent — it imports keys from a known backup if the local api.txt is
-        // empty, and registers a hidden logon autostart task when the launcher is
-        // present. Safe to run on every start (idempotent, non-elevated).
+        // Self-healing setup: on ANY fresh Windows, running the proxy once makes
+        // it permanent — it creates api.txt/config.json from the portable
+        // defaults when missing, generates a fresh local key, and registers a
+        // hidden logon autostart task when the launcher is present. Safe to run
+        // on every start (idempotent, non-elevated). No machine-specific paths.
         private static void EnsureSelfSetup()
         {
             try
@@ -739,18 +741,29 @@ namespace OpencodeGoProxy
                 try
                 {
                     string keysPath = Path.Combine(baseDir, "api.txt");
-                    bool hasKeys = false;
-                    if (File.Exists(keysPath))
-                        foreach (string line in File.ReadAllLines(keysPath))
-                        {
-                            string k = line.Trim();
-                            if (k.Length > 0 && !k.StartsWith("#") && !k.StartsWith("//")) { hasKeys = true; break; }
-                        }
-                    string backup = @"F:\backup\windowsapps\credentials\opencodego\api.txt";
-                    if (!hasKeys && File.Exists(backup))
+                    if (!File.Exists(keysPath))
                     {
-                        File.Copy(backup, keysPath, true);
-                        Console.WriteLine("AUTOSETUP keys_imported=true");
+                        File.WriteAllText(keysPath,
+                            "# Put one OpenCode Go API key per line. Lines starting with # are ignored." + Environment.NewLine,
+                            new UTF8Encoding(false));
+                        Console.WriteLine("AUTOSETUP keys_template_created=true");
+                    }
+                }
+                catch { }
+                try
+                {
+                    string defaultCfg = Path.Combine(baseDir, "config.default.json");
+                    string liveCfg = Path.Combine(baseDir, "config.json");
+                    if (!File.Exists(liveCfg) && File.Exists(defaultCfg))
+                    {
+                        var template = Json.Deserialize<ProxyConfig>(File.ReadAllText(defaultCfg, Encoding.UTF8));
+                        template.local_api_key = CreateLocalApiKey();
+                        template.credential_source = "api.txt";
+                        template.zen_credential_source = "api.txt";
+                        template.credential_count = 0;
+                        template.zen_credential_count = 0;
+                        WriteConfigAtomically(liveCfg, template);
+                        Console.WriteLine("AUTOSETUP config_created_from_defaults=true");
                     }
                 }
                 catch { }
