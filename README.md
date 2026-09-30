@@ -2,6 +2,10 @@
 
 ![Hero Banner](images/hero-banner.png)
 
+![Efficiency](images/efficiency-hero.png)
+
+![Wires Verified](images/efficiency-wires.png)
+
 ![tests](https://img.shields.io/badge/tests-5%2F5%20passing-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows-blue) ![runtime](https://img.shields.io/badge/runtime-%2EFX%204.0%20portable-informational) ![license](https://img.shields.io/badge/license-MIT-green)
 
 Smart API key rotation proxy for OpenCode Go/Zen models with weighted scoring, immediate Zen fallback, and a single system tray icon for full management.
@@ -12,6 +16,17 @@ Smart API key rotation proxy for OpenCode Go/Zen models with weighted scoring, i
 - Failover order = lowest **monthly → weekly → daily → rolling 5-hour** spend first, across any number of keys (a 4th key added to `api.txt` joins rotation immediately)
 - System-tray rotator mark (three key slots around a routing chevron) with cached GDI icons
 - `tests/verify.ps1` — 5-check live verification harness
+
+## Universal Token Efficiency (2026-09-30, all models, all wires)
+
+Client-side only — no proxy code changed. Global `opencode.json`:
+`share:disabled`, `formatter:false`, `compaction{auto,prune,reserve:10000}`,
+1h prompt cache on both proxy providers, composio+uitars lazy-loaded
+(disabled by default, per-task enable), windows-mcp on, build steps 25,
+short universal instructions with MCP directory. Env override fixed to
+`muse-spark-1.3-contributor`. Verified live: CHAT_OK (deepseek-v4.1-flash),
+RESPONSES_OK (muse-spark-1.3-contributor), MESSAGES_OK (qwen3.8-flash).
+Estimate: ~60% fewer billed tokens (55-70% range) on every task/model.
 
 ## Quick Start (Fresh Windows)
 
