@@ -10,12 +10,11 @@
 
 Smart API key rotation proxy for OpenCode Go/Zen models with weighted scoring, immediate Zen fallback, and a single system tray icon for full management.
 
-**Highlights (current hard build):**
-- Wire ladder always starts on the client's own wire — no untranslated cross-wire attempts, no more `invalid_union` / empty `event:error` frames
-- In-band `event: error` SSE frames and `FreeTierError` 403s are treated as upstream failures: the proxy keeps rotating keys and, worst case, answers with a valid retryable error instead of a broken stream
-- Failover order = lowest **monthly → weekly → daily → rolling 5-hour** spend first, across any number of keys (a 4th key added to `api.txt` joins rotation immediately)
-- System-tray rotator mark (three key slots around a routing chevron) with cached GDI icons
-- `tests/verify.ps1` — 5-check live verification harness
+**Highlights (current hard build v10.1):**
+- Streaming-first: client headers flush on upstream first byte; per-attempt TTFB 25s + attempt 90s + global first-byte budget 240s — long generations never trip the 300s client header wait, hung keys fail over in seconds with zero slowdown to healthy streams
+- Fresh `x-opencode-session` per key attempt + full OpenCode identity: paid funds/policy rotation exhausts every key before any Zen divert, so one transient verdict can never surface `insufficient funds` / `trains on request data` while headroom exists
+- Generic policy-class matcher + synthetic retryable 503 final relay: raw gateway 400/403/error-frame text never reaches a client for any model, key, or account
+- Exact key-count reconcile (`KEYS_RECONCILED`): add/remove/reorder in `api.txt` joins rotation immediately with stale scores pruned; 90s funds cooldown re-scored by the 20s usage poller
 
 ## Universal Token Efficiency (2026-09-30, all models, all wires)
 
